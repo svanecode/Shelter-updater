@@ -46,32 +46,24 @@ PAGE_SIZE = 1000
 
 def fetch_all_shelters() -> List[Dict[str, Any]]:
     """
-    Fetches shelter records last checked over a month ago (or never checked) using pagination.
+    Fetches the next 1000 shelter records to check, prioritizing null values first, then oldest checked.
     """
-    shelters: List[Dict[str, Any]] = []
-    offset = 0
-    cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
-    while True:
-        params = {
-            'select': '*',
-            'order': 'last_checked.asc.nullsfirst',
-            'or': f'(last_checked.is.null,last_checked.lt.{cutoff})',
-            'limit': PAGE_SIZE,
-            'offset': offset
-        }
-        url = f"{SUPABASE_URL}/rest/v1/sheltersv2"
-        try:
-            r = session.get(url, headers=HEADERS, params=params)
-            r.raise_for_status()
-            batch = r.json()
-            if not isinstance(batch, list) or not batch:
-                break
-            shelters.extend(batch)
-            offset += PAGE_SIZE
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching shelters: {e}")
-            break
-    return shelters
+    params = {
+        'select': '*',
+        'order': 'last_checked.asc.nullsfirst',
+        'limit': PAGE_SIZE
+    }
+    url = f"{SUPABASE_URL}/rest/v1/sheltersv2"
+    try:
+        r = session.get(url, headers=HEADERS, params=params)
+        r.raise_for_status()
+        shelters = r.json()
+        if not isinstance(shelters, list):
+            return []
+        return shelters
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching shelters: {e}")
+        return []
 
 
 def fetch_bbr_data(bygning_id: str) -> Optional[Dict[str, Any]]:

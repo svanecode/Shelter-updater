@@ -1,17 +1,31 @@
-name: Shelter Updater
+name: Shelter Discovery & Audit
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # Every day at 02:00 UTC
+    # Run shelter discovery twice daily at 02:00 and 14:00 UTC
+    - cron: '0 2,14 * * *'
+    # Run shelter audit weekly on Sundays at 03:00 UTC
+    - cron: '0 3 * * 0'
   workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job to run'
+        required: false
+        default: 'discovery'
+        type: choice
+        options:
+        - discovery
+        - audit
+        - report
 
 jobs:
-  new-shelters:
-    name: Run new_shelters.py
+  shelter-discovery:
+    name: Global Shelter Discovery
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'discovery')
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -23,7 +37,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests urllib3 python-dotenv
 
-      - name: Run new_shelters.py
+      - name: Run Global Shelter Discovery
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -32,14 +46,25 @@ jobs:
           DATAFORDELER_USERNAME: ${{ secrets.DATAFORDELER_USERNAME }}
           DATAFORDELER_PASSWORD: ${{ secrets.DATAFORDELER_PASSWORD }}
         run: |
-          python new_shelters.py
+          echo "Starting global shelter discovery..."
+          echo "Processing 834 pages per run (twice daily for 30-day completion)"
+          python new_shelters_global.py
+
+      - name: Monitor Progress
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          echo "Checking progress..."
+          python monitor_global_progress.py
 
   shelter-audit:
-    name: Run shelter_audit.py
+    name: Shelter Audit
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'audit')
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -51,7 +76,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests urllib3 python-dotenv
 
-      - name: Run shelter_audit.py
+      - name: Run Shelter Audit
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -60,4 +85,31 @@ jobs:
           DATAFORDELER_USERNAME: ${{ secrets.DATAFORDELER_USERNAME }}
           DATAFORDELER_PASSWORD: ${{ secrets.DATAFORDELER_PASSWORD }}
         run: |
-          python shelter_audit.py 
+          echo "Starting shelter audit..."
+          python shelter_audit.py
+
+  progress-report:
+    name: Progress Report
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'report'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests urllib3 python-dotenv
+
+      - name: Generate Progress Report
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          echo "Generating progress report..."
+          python monitor_global_progress.py 

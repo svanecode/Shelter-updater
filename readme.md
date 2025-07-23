@@ -1,116 +1,158 @@
-# UPDATER: Shelter Data Management
+# Shelter Discovery System
 
-This repository contains two main Python scripts for managing and auditing shelter (sikringsrum) data in Denmark, integrating with Supabase and public APIs (BBR and DAR).
-
-## Table of Contents
-- [Overview](#overview)
-- [Scripts](#scripts)
-  - [new_shelters.py](#new_shelterspy)
-  - [shelter_audit.py](#shelter_auditpy)
-- [Setup & Configuration](#setup--configuration)
-- [Usage](#usage)
-- [API & Database](#api--database)
-- [Notes](#notes)
-
----
+A comprehensive system for discovering and monitoring shelters across Denmark using the BBR (Building and Dwelling Register) API.
 
 ## Overview
 
-These scripts automate the discovery, updating, and auditing of shelter data:
-- **new_shelters.py**: Discovers and adds new shelters from the BBR API to a Supabase database.
-- **shelter_audit.py**: Audits existing shelters in the database, updating or soft-deleting records that are outdated or invalid.
+This system uses a **global page-based strategy** to process all buildings across Denmark without municipality-specific filtering. It processes pages in batches and tracks progress globally to ensure all pages are processed within a **30-day cycle**.
 
-Both scripts use the BBR and DAR APIs for authoritative building and address data, and store results in a Supabase PostgreSQL database.
+## Key Features
 
----
+- **Global Strategy**: Processes all buildings across Denmark without municipality boundaries
+- **30-Day Cycles**: Completes full processing of all pages every 30 days
+- **Automated Processing**: Runs twice daily via GitHub Actions
+- **Progress Tracking**: Monitors completion status and provides detailed reports
+- **Duplicate Prevention**: Prevents duplicate shelter entries
+- **Audit System**: Validates and maintains data quality
 
-## Scripts
+## Architecture
 
-### new_shelters.py
+### Global Strategy
+- **Batch Size**: 834 pages per run
+- **Frequency**: Twice daily (02:00 and 14:00 UTC)
+- **Cycle Duration**: 30 days
+- **Total Pages**: ~50,000 estimated pages across Denmark
+- **Completion Rate**: ~1,668 pages per day
 
-**Purpose:**
-- Scans all Danish municipalities (kommuner) for new shelters (buildings with shelter capacity) using the BBR API.
-- Adds new shelters to the `sheltersv2` table in Supabase, including address and capacity info from the DAR API.
-- Tracks progress per municipality and supports resuming interrupted runs.
+### Processing Flow
+1. **Page Processing**: Processes pages sequentially across all of Denmark
+2. **Progress Tracking**: Updates global progress table with current page
+3. **Cycle Management**: Resets to page 0 every 30 days
+4. **Duplicate Checking**: Prevents duplicate shelter entries
+5. **Data Validation**: Ensures data quality and completeness
 
-**Key Features:**
-- Fetches and resumes from the last processed page for each municipality.
-- Avoids duplicates by checking existing shelter IDs.
-- Can process a specific municipality by passing its code as a command-line argument.
-- Marks municipalities as complete when finished.
+## Files
 
-**Usage:**
+### Core Scripts
+- `new_shelters_global.py` - Main shelter discovery script (global strategy)
+- `shelter_audit.py` - Data validation and audit script
+- `monitor_global_progress.py` - Progress monitoring and reporting
+
+### Utilities
+- `calculate_optimal_batch.py` - Calculates optimal batch sizes for different frequencies
+
+### GitHub Actions
+- `.github/workflows/shelter-updater.yml` - Main automation workflow
+- `.github/workflows/progress-monitor.yml` - Weekly progress monitoring
+
+## Setup
+
+### Environment Variables
 ```bash
-python new_shelters.py [kommunekode]
+SUPABASE_URL=your_supabase_url
+SUPABASE_KEY=your_supabase_key
+BBR_API_URL=your_bbr_api_url
+DAR_API_URL=your_dar_api_url
+DATAFORDELER_USERNAME=your_username
+DATAFORDELER_PASSWORD=your_password
 ```
-- If `kommunekode` is provided, only that municipality is processed.
-- Otherwise, the next municipality in the queue is processed.
 
----
+### Database Tables
+The system uses these Supabase tables:
+- `shelters` - Main shelter data
+- `global_progress` - Global processing progress
 
-### shelter_audit.py
+## Usage
 
-**Purpose:**
-- Audits all shelters in the database that have not been checked in the last 30 days (or never checked).
-- For each shelter:
-  - Fetches the latest data from BBR and DAR APIs.
-  - Updates shelter info if anything has changed.
-  - Soft-deletes shelters that are no longer valid (e.g., no longer have shelter capacity, wrong status, or missing in BBR).
-
-**Key Features:**
-- Uses robust retry logic for API requests.
-- Logs all actions and errors.
-- Soft-deletes by marking records with a timestamp and reason, not physical deletion.
-
-**Usage:**
+### Manual Execution
 ```bash
+# Run shelter discovery
+python new_shelters_global.py
+
+# Check progress
+python monitor_global_progress.py
+
+# Run audit
 python shelter_audit.py
+
+# Calculate optimal batch sizes
+python calculate_optimal_batch.py
 ```
-- No arguments needed. Processes all outdated shelters.
 
----
+### GitHub Actions
+The system runs automatically via GitHub Actions:
+- **Shelter Discovery**: Twice daily at 02:00 and 14:00 UTC
+- **Shelter Audit**: Weekly on Sundays at 03:00 UTC
+- **Progress Monitoring**: Weekly on Sundays at 10:00 UTC
 
-## Setup & Configuration
+### Manual Trigger
+You can manually trigger workflows via GitHub Actions with these options:
+- `discovery` - Run shelter discovery
+- `audit` - Run shelter audit
+- `report` - Generate progress report
 
-1. **Python Requirements:**
-   - Python 3.7+
-   - Install dependencies:
-     ```bash
-     pip install requests urllib3 python-dotenv
-     ```
+## Monitoring
 
-2. **Environment Variables:**
-   - Create a `.env` file in the project root with the following variables:
-     ```env
-     SUPABASE_URL=your_supabase_url
-     SUPABASE_KEY=your_supabase_key
-     BBR_API_URL=your_bbr_api_url
-     DAR_API_URL=your_dar_api_url
-     DATAFORDELER_USERNAME=your_datafordeler_username
-     DATAFORDELER_PASSWORD=your_datafordeler_password
-     ```
-   - The scripts will automatically load these variables using `python-dotenv`.
+### Progress Tracking
+The system tracks:
+- Current page being processed
+- Pages completed in current cycle
+- Time since last update
+- Estimated completion time
+- Cycle status (in progress/complete)
 
-3. **Supabase Database:**
-   - The scripts expect a Supabase table `sheltersv2` with fields for shelter info, and a `kommunekoder` table for tracking municipality progress.
-   - See the scripts for expected field names.
+### Performance Metrics
+- **Processing Rate**: ~1,668 pages per day
+- **Cycle Completion**: Every 30 days
+- **Batch Efficiency**: 834 pages per run
+- **Total Coverage**: All of Denmark
 
----
+## Configuration
 
-## API & Database
+### Batch Size Optimization
+The current configuration processes 834 pages per run, twice daily, to complete all pages within 30 days. You can adjust this based on:
 
-- **BBR API**: Used to fetch building (shelter) data.
-- **DAR API**: Used to fetch address data for shelters.
-- **Supabase**: Used as the main database for storing and updating shelter records.
+- **Daily Processing**: 1,667 pages per run
+- **Twice Daily**: 834 pages per run (current)
+- **Every 6 Hours**: 417 pages per run
+- **Every 4 Hours**: 278 pages per run
 
----
+Use `calculate_optimal_batch.py` to find the optimal configuration for your needs.
 
-## Notes
+## Benefits
 
-- **Sensitive Data**: All API keys and credentials are now loaded from environment variables in a `.env` file. Do not commit your `.env` file to version control.
-- **Error Handling**: Both scripts include error handling and logging, but you should monitor logs for failed updates or API issues.
-- **Extending**: You can adapt the scripts for other types of building audits or data sources by modifying the API queries and database schema.
+### Efficiency
+- **Global Processing**: No municipality boundaries or complex tracking
+- **Even Distribution**: Consistent workload across time
+- **Scalable**: Easy to adjust batch sizes and frequencies
 
----
+### Reliability
+- **Progress Persistence**: Survives interruptions and restarts
+- **Duplicate Prevention**: Robust duplicate checking
+- **Data Validation**: Comprehensive audit system
 
-For more details, see comments in each script.
+### Maintainability
+- **Simple Logic**: Straightforward page-based processing
+- **Clear Monitoring**: Easy to track progress and performance
+- **Flexible Configuration**: Easy to adjust for different requirements
+
+## Troubleshooting
+
+### Common Issues
+1. **API Rate Limits**: Reduce batch size if hitting rate limits
+2. **Processing Delays**: Increase batch size or frequency
+3. **Database Errors**: Check Supabase connection and permissions
+4. **Progress Stuck**: Verify global_progress table exists and is accessible
+
+### Performance Tuning
+- Use `calculate_optimal_batch.py` to find optimal settings
+- Monitor progress with `monitor_global_progress.py`
+- Adjust batch sizes based on API performance
+- Consider different scheduling frequencies
+
+## Future Enhancements
+
+- **Adaptive Batch Sizing**: Adjust batch size based on API performance
+- **Real-time Monitoring**: Web dashboard for progress tracking
+- **Multi-region Processing**: Parallel processing across regions
+- **Advanced Analytics**: Detailed performance and coverage metrics
