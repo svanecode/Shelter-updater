@@ -2,8 +2,8 @@ name: Shelter Discovery & Audit
 
 on:
   schedule:
-    # Run shelter discovery twice daily at 02:00 and 14:00 UTC
-    - cron: '0 2,14 * * *'
+    # Run shelter discovery once daily at 02:00 UTC
+    - cron: '0 2 * * *'
     # Run shelter audit weekly on Sundays at 03:00 UTC
     - cron: '0 3 * * 0'
   workflow_dispatch:
@@ -22,6 +22,9 @@ jobs:
   shelter-discovery:
     name: Global Shelter Discovery
     runs-on: ubuntu-latest
+    concurrency:
+      group: shelter-discovery
+      cancel-in-progress: true
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'discovery')
     steps:
       - name: Checkout repository
@@ -47,7 +50,7 @@ jobs:
           DATAFORDELER_PASSWORD: ${{ secrets.DATAFORDELER_PASSWORD }}
         run: |
           echo "Starting global shelter discovery..."
-          echo "Processing 834 pages per run (twice daily for 30-day completion)"
+          echo "Processing 834 pages per run (once daily for 60-day completion)"
           python new_shelters_global.py
 
       - name: Monitor Progress
@@ -61,6 +64,9 @@ jobs:
   shelter-audit:
     name: Shelter Audit
     runs-on: ubuntu-latest
+    concurrency:
+      group: shelter-audit
+      cancel-in-progress: true
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'audit')
     steps:
       - name: Checkout repository
@@ -91,6 +97,9 @@ jobs:
   progress-report:
     name: Progress Report
     runs-on: ubuntu-latest
+    concurrency:
+      group: progress-report
+      cancel-in-progress: true
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'report'
     steps:
       - name: Checkout repository
