@@ -20,6 +20,8 @@ import time
 import sys
 from dotenv import load_dotenv
 import os
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- Configuration ---
 load_dotenv()
@@ -31,12 +33,24 @@ DATAFORDELER_USERNAME = os.getenv("DATAFORDELER_USERNAME")
 DATAFORDELER_PASSWORD = os.getenv("DATAFORDELER_PASSWORD")
 
 # Global strategy configuration
-PAGES_PER_BATCH = 834  # Number of pages to process per run (optimized for twice-daily 30-day cycle)
+PAGES_PER_BATCH = 834  # Number of pages to process per run (optimized for once-daily 60-day cycle)
+                       # At ~2 seconds per page (1s sleep + 1s request), this is ~28 minutes per run
 CYCLE_DAYS = 30  # Days to complete a full cycle
 ESTIMATED_TOTAL_PAGES = 50000  # Rough estimate of total pages across Denmark
 
 # Calculate pages per day to complete within CYCLE_DAYS
 PAGES_PER_DAY = ESTIMATED_TOTAL_PAGES // CYCLE_DAYS  # ~1,667 pages per day
+
+# Maximum runtime before graceful exit (in seconds) - set to 5 hours to stay under 6-hour GitHub Actions limit
+MAX_RUNTIME_SECONDS = 5 * 60 * 60
+
+# Request timeout configuration (in seconds)
+REQUEST_TIMEOUT = 30  # Timeout for API requests
+CONNECT_TIMEOUT = 10  # Timeout for establishing connection
+
+# Rate limiting configuration
+API_SLEEP_TIME = 1.0  # Seconds to wait between requests (increased for API limits)
+RATE_LIMIT_BACKOFF = 60  # Seconds to wait when hitting rate limits
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -46,6 +60,34 @@ HEADERS = {
 }
 
 # --- Helper Functions ---
+
+def create_session_with_retries():
+    """
+    Creates a requests session with retry logic and connection pooling.
+    This helps handle transient network errors and connection issues.
+    Note: 429 (rate limit) is NOT included in retry list to handle it manually with longer backoff.
+    """
+    session = requests.Session()
+
+    # Configure retry strategy - conservative to respect API limits
+    retry_strategy = Retry(
+        total=3,  # Reduced from 5 to be more conservative
+        backoff_factor=3,  # Increased backoff: 3, 6, 12 seconds
+        status_forcelist=[500, 502, 503, 504],  # Server errors only, NOT 429
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST", "PUT", "PATCH"],
+        raise_on_status=False  # Don't raise exception, let us handle it
+    )
+
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,  # Number of connection pools to cache
+        pool_maxsize=20  # Maximum number of connections to save in the pool
+    )
+
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    return session
 
 def get_current_cycle():
     """Returns the current 30-day cycle identifier (YYYY-MM-DD format for cycle start)."""
@@ -66,7 +108,7 @@ def is_cycle_complete(last_updated):
     except (ValueError, AttributeError):
         return False
 
-def get_global_progress():
+def get_global_progress(session):
     """
     Fetches the current global progress from the database.
     Creates the table if it doesn't exist.
@@ -74,7 +116,7 @@ def get_global_progress():
     """
     url = f"{SUPABASE_URL}/rest/v1/global_progress?select=last_page,last_updated&limit=1"
     try:
-        r = requests.get(url, headers=HEADERS)
+        r = session.get(url, headers=HEADERS, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         r.raise_for_status()
         data = r.json()
         if data:
@@ -86,7 +128,7 @@ def get_global_progress():
         if "404" in str(e):
             # Table doesn't exist, create it
             print("Global progress table doesn't exist. Creating it...")
-            if create_global_progress_table():
+            if create_global_progress_table(session):
                 return {"last_page": 0, "last_updated": None}
             else:
                 print("Failed to create global_progress table. Please create it manually in Supabase dashboard.")
@@ -95,18 +137,18 @@ def get_global_progress():
             print(f"Error fetching global progress: {e}")
             return None
 
-def create_global_progress_table():
+def create_global_progress_table(session):
     """Creates the global_progress table by inserting initial data."""
     print("Creating global_progress table...")
-    
+
     url = f"{SUPABASE_URL}/rest/v1/global_progress"
     data = {
         "last_page": 0,
         "last_updated": datetime.utcnow().isoformat()
     }
-    
+
     try:
-        r = requests.post(url, headers=HEADERS, json=data)
+        r = session.post(url, headers=HEADERS, json=data, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         if r.status_code in [201, 200]:
             print("✅ global_progress table created successfully")
             return True
@@ -123,28 +165,28 @@ def create_global_progress_table():
         print(f"❌ Error creating global_progress table: {e}")
         return False
 
-def update_global_progress(page_number):
+def update_global_progress(session, page_number):
     """Updates the global progress to the specified page number."""
     # First, get the current record ID
     url = f"{SUPABASE_URL}/rest/v1/global_progress?select=id&limit=1"
     try:
-        r = requests.get(url, headers=HEADERS)
+        r = session.get(url, headers=HEADERS, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         r.raise_for_status()
         data = r.json()
         if not data:
             print("  - Warning: No global progress record found")
             return
-        
+
         record_id = data[0]['id']
-        
+
         # Update the specific record by ID
         update_url = f"{SUPABASE_URL}/rest/v1/global_progress?id=eq.{record_id}"
         update_data = {
             "last_page": page_number,
             "last_updated": datetime.utcnow().isoformat()
         }
-        
-        r = requests.patch(update_url, headers=HEADERS, json=update_data)
+
+        r = session.patch(update_url, headers=HEADERS, json=update_data, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         if r.status_code in [200, 204]:
             print(f"  - Updated global progress to page {page_number}")
         else:
@@ -152,7 +194,7 @@ def update_global_progress(page_number):
     except requests.exceptions.RequestException as e:
         print(f"  - Warning: Error updating global progress: {e}")
 
-def fetch_existing_shelter_ids():
+def fetch_existing_shelter_ids(session):
     """
     Fetches ALL existing bygning_id from the database, handling pagination.
     This is crucial for accurately checking for duplicates.
@@ -167,30 +209,30 @@ def fetch_existing_shelter_ids():
             # Use the Range header to control pagination
             paginated_headers = HEADERS.copy()
             paginated_headers['Range'] = f"{offset}-{offset + limit - 1}"
-            
+
             url = f"{SUPABASE_URL}/rest/v1/sheltersv2?select=bygning_id"
-            r = requests.get(url, headers=paginated_headers)
+            r = session.get(url, headers=paginated_headers, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
             r.raise_for_status()
-            
+
             data = r.json()
             if not data:
                 # No more results, we have fetched everything
                 break
-            
+
             for item in data:
                 ids.add(item['bygning_id'])
-            
+
             offset += limit
-            
+
         except requests.exceptions.RequestException as e:
             print(f"\nFatal error fetching existing shelter IDs: {e}")
             print("Please check your SUPABASE_URL, SUPABASE_KEY, and network connection.")
             return None
-    
+
     print(f"\nSuccessfully fetched a total of {len(ids)} existing shelter IDs.")
     return ids
 
-def fetch_dar_data(husnummer_id):
+def fetch_dar_data(session, husnummer_id):
     """Fetches address data from the DAR API using the husnummer UUID from BBR."""
     params = {
         "username": DATAFORDELER_USERNAME,
@@ -199,7 +241,7 @@ def fetch_dar_data(husnummer_id):
         "id": husnummer_id
     }
     try:
-        r = requests.get(f"{DAR_API_URL}/husnummer", params=params)
+        r = session.get(f"{DAR_API_URL}/husnummer", params=params, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         r.raise_for_status()
         if r.json():
             return r.json()[0]
@@ -207,11 +249,11 @@ def fetch_dar_data(husnummer_id):
         print(f"    - Warning: Error fetching DAR data for husnummer ID {husnummer_id}: {e}")
     return None
 
-def add_shelter_to_db(shelter_data):
+def add_shelter_to_db(session, shelter_data):
     """Adds a new shelter record to the Supabase database."""
     url = f"{SUPABASE_URL}/rest/v1/sheltersv2"
     try:
-        r = requests.post(url, headers=HEADERS, json=shelter_data)
+        r = session.post(url, headers=HEADERS, json=shelter_data, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         r.raise_for_status()
         return r.status_code == 201
     except requests.exceptions.RequestException as e:
@@ -222,7 +264,7 @@ def add_shelter_to_db(shelter_data):
         print("    - Please check your SUPABASE_URL, SUPABASE_KEY, and network connection.")
     return False
 
-def process_global_batch(start_page, existing_ids):
+def process_global_batch(session, start_page, existing_ids, start_time):
     """
     Processes a batch of global pages.
     Returns the number of new shelters found and the last processed page.
@@ -230,10 +272,20 @@ def process_global_batch(start_page, existing_ids):
     total_new_shelters = 0
     current_page = start_page
     end_page = start_page + PAGES_PER_BATCH - 1
-    
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10  # Stop if we hit 10 errors in a row
+
     print(f"\nProcessing global pages {start_page} to {end_page}...")
-    
+    print(f"Maximum runtime: {MAX_RUNTIME_SECONDS / 3600:.1f} hours")
+
     while current_page <= end_page:
+        # Check if we're approaching max runtime (exit gracefully to avoid timeout)
+        elapsed_time = time.time() - start_time
+        if elapsed_time > MAX_RUNTIME_SECONDS:
+            print(f"\n  - Approaching maximum runtime ({elapsed_time / 3600:.1f} hours)")
+            print(f"  - Exiting gracefully. Progress saved at page {current_page - 1}")
+            return total_new_shelters, current_page - 1, False
+
         params = {
             "username": DATAFORDELER_USERNAME,
             "password": DATAFORDELER_PASSWORD,
@@ -242,17 +294,40 @@ def process_global_batch(start_page, existing_ids):
         }
         try:
             print(f"  - Fetching global page {current_page}...", end='\r')
-            r = requests.get(f"{BBR_API_URL}/bygning", params=params)
+            r = session.get(f"{BBR_API_URL}/bygning", params=params, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
+
+            # Handle rate limiting explicitly
+            if r.status_code == 429:
+                consecutive_errors += 1
+                print(f"\n  - Rate limit hit at page {current_page}!")
+                print(f"  - Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    print("  - Too many consecutive rate limits. Stopping batch processing.")
+                    break
+
+                # Save progress before backing off
+                if current_page > start_page:
+                    update_global_progress(session, current_page - 1)
+
+                print(f"  - Backing off for {RATE_LIMIT_BACKOFF} seconds...")
+                time.sleep(RATE_LIMIT_BACKOFF)
+                # Don't increment current_page - retry the same page
+                continue
+
             r.raise_for_status()
             buildings_on_page = r.json()
+
+            # Reset error counter on successful request
+            consecutive_errors = 0
 
             if not buildings_on_page:
                 print(f"\n  - Reached end of data at page {current_page}.")
                 return total_new_shelters, current_page - 1, True  # True = complete
-            
+
             # Filter the current page for shelters
             shelter_buildings = [
-                b for b in buildings_on_page 
+                b for b in buildings_on_page
                 if b.get("status") == "6" and b.get("byg069Sikringsrumpladser", 0) > 0
             ]
 
@@ -264,10 +339,10 @@ def process_global_batch(start_page, existing_ids):
                     if bygning_id and bygning_id not in existing_ids:
                         print(f"    -> New shelter found! ID: {bygning_id}. Processing...")
                         total_new_shelters += 1
-                        
+
                         husnummer_id = bbr.get("husnummer")
-                        dar_data = fetch_dar_data(husnummer_id) if husnummer_id else None
-                        
+                        dar_data = fetch_dar_data(session, husnummer_id) if husnummer_id else None
+
                         new_shelter_payload = {
                             "bygning_id": bygning_id,
                             "shelter_capacity": bbr.get("byg069Sikringsrumpladser"),
@@ -281,22 +356,67 @@ def process_global_batch(start_page, existing_ids):
                         }
 
                         print(f"      - Adding shelter at address: {new_shelter_payload.get('address') or 'N/A'}")
-                        if add_shelter_to_db(new_shelter_payload):
+                        if add_shelter_to_db(session, new_shelter_payload):
                             print("      - Successfully added to the database.")
                             existing_ids.add(bygning_id)
                         else:
                             print("      - Failed to add to the database.")
-            
-            # Update progress after successfully processing the page
-            update_global_progress(current_page)
+
+            # Update progress more frequently (every page instead of at the end)
+            update_global_progress(session, current_page)
             current_page += 1
-            time.sleep(0.5)  # Be respectful to the API
-            
+            time.sleep(API_SLEEP_TIME)  # Be respectful to the API rate limits
+
+        except requests.exceptions.Timeout as e:
+            consecutive_errors += 1
+            print(f"\n  - Timeout error fetching page {current_page}: {e}")
+            print(f"  - Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print("  - Too many consecutive errors. Stopping batch processing.")
+                break
+
+            # Save progress before potentially failing
+            if current_page > start_page:
+                update_global_progress(session, current_page - 1)
+
+            print("  - Waiting 5 seconds before retry...")
+            time.sleep(5)
+            # Don't increment current_page - retry the same page
+
+        except requests.exceptions.ConnectionError as e:
+            consecutive_errors += 1
+            print(f"\n  - Connection error fetching page {current_page}: {e}")
+            print(f"  - Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print("  - Too many consecutive errors. Stopping batch processing.")
+                break
+
+            # Save progress before potentially failing
+            if current_page > start_page:
+                update_global_progress(session, current_page - 1)
+
+            print("  - Waiting 10 seconds before retry...")
+            time.sleep(10)
+            # Don't increment current_page - retry the same page
+
         except requests.exceptions.RequestException as e:
+            consecutive_errors += 1
             print(f"\n  - Error fetching page {current_page}: {e}")
-            print("  - Stopping batch processing.")
-            break
-    
+            print(f"  - Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print("  - Too many consecutive errors. Stopping batch processing.")
+                break
+
+            # Save progress before potentially failing
+            if current_page > start_page:
+                update_global_progress(session, current_page - 1)
+
+            print("  - Skipping to next page...")
+            current_page += 1
+
     return total_new_shelters, current_page - 1, False  # False = not complete
 
 def main():
@@ -305,9 +425,12 @@ def main():
     Processes all buildings across Denmark without municipality-specific tracking.
     """
     print("Starting global shelter discovery strategy...")
-    
+
+    # Create session with retry logic and connection pooling
+    session = create_session_with_retries()
+
     # Check if we should start a new monthly cycle
-    progress = get_global_progress()
+    progress = get_global_progress(session)
     if progress is None:
         print("❌ Could not initialize global progress. Please create the global_progress table manually.")
         print("   Run this SQL in your Supabase dashboard:")
@@ -317,10 +440,10 @@ def main():
         print("       last_updated TIMESTAMP DEFAULT NOW()")
         print("   );")
         sys.exit(1)
-    
+
     current_cycle = get_current_cycle()
     last_page = progress.get('last_page', 0)
-    
+
     # Check if we've actually processed any pages this month
     if last_page > 0 and is_cycle_complete(progress.get('last_updated')):
         print(f"Current cycle ({current_cycle}) is already complete.")
@@ -330,38 +453,46 @@ def main():
         print(f"Starting new cycle ({current_cycle}) from page 0")
     else:
         print(f"Continuing cycle ({current_cycle}) from page {last_page}")
-    
+
     # Fetch existing shelter IDs for duplicate checking
-    existing_ids = fetch_existing_shelter_ids()
+    existing_ids = fetch_existing_shelter_ids(session)
     if existing_ids is None:
         sys.exit("Could not fetch existing shelter IDs. Aborting.")
 
     # Determine starting page
     start_page = progress.get('last_page', 0) + 1
-    
+
     print(f"\nResuming from page {start_page}")
     print(f"Current cycle: {current_cycle}")
-    
+
+    # Record start time for runtime limit checking
+    start_time = time.time()
+
     # Process the batch
-    new_shelters, last_processed_page, is_complete = process_global_batch(start_page, existing_ids)
-    
+    new_shelters, last_processed_page, is_complete = process_global_batch(session, start_page, existing_ids, start_time)
+
     # Summary
+    elapsed_time = time.time() - start_time
     print(f"\n{'='*60}")
     print("GLOBAL STRATEGY RUN SUMMARY")
     print(f"{'='*60}")
+    print(f"Runtime: {elapsed_time / 60:.1f} minutes ({elapsed_time / 3600:.2f} hours)")
     print(f"Pages processed: {last_processed_page - start_page + 1}")
     print(f"Total new shelters found: {new_shelters}")
     print(f"Last processed page: {last_processed_page}")
     print(f"Current cycle: {current_cycle}")
-    
+
     if is_complete:
         print("✓ All pages have been processed!")
         print("Cycle is now complete.")
     else:
         pages_remaining = ESTIMATED_TOTAL_PAGES - last_processed_page
         print(f"⏸ {pages_remaining} estimated pages remaining in this cycle.")
-    
+
     print(f"\nGlobal strategy run finished successfully.")
+
+    # Close the session
+    session.close()
 
 if __name__ == "__main__":
     main() 
