@@ -45,8 +45,8 @@ PAGES_PER_DAY = ESTIMATED_TOTAL_PAGES // CYCLE_DAYS  # ~1,667 pages per day
 MAX_RUNTIME_SECONDS = 5 * 60 * 60
 
 # Request timeout configuration (in seconds)
-REQUEST_TIMEOUT = 30  # Timeout for API requests
-CONNECT_TIMEOUT = 10  # Timeout for establishing connection
+REQUEST_TIMEOUT = 60  # Timeout for API requests (increased from 30s)
+CONNECT_TIMEOUT = 20  # Timeout for establishing connection (increased from 10s)
 
 # Rate limiting configuration
 API_SLEEP_TIME = 1.0  # Seconds to wait between requests (increased for API limits)
@@ -273,7 +273,8 @@ def process_global_batch(session, start_page, existing_ids, start_time):
     current_page = start_page
     end_page = start_page + PAGES_PER_BATCH - 1
     consecutive_errors = 0
-    MAX_CONSECUTIVE_ERRORS = 10  # Stop if we hit 10 errors in a row
+    MAX_CONSECUTIVE_ERRORS = 15  # Increased tolerance for API connection issues
+    page_retry_count = 0  # Track retries for the current page
 
     print(f"\nProcessing global pages {start_page} to {end_page}...")
     print(f"Maximum runtime: {MAX_RUNTIME_SECONDS / 3600:.1f} hours")
@@ -299,27 +300,34 @@ def process_global_batch(session, start_page, existing_ids, start_time):
             # Handle rate limiting explicitly
             if r.status_code == 429:
                 consecutive_errors += 1
+                page_retry_count += 1
+
+                # Use exponential backoff for rate limits: 60, 120, 240 seconds (capped at 300s = 5 min)
+                backoff_time = min(RATE_LIMIT_BACKOFF * (2 ** (page_retry_count - 1)), 300)
+
                 print(f"\n  - Rate limit hit at page {current_page}!")
-                print(f"  - Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+                print(f"  - Retry {page_retry_count} | Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
 
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    print("  - Too many consecutive rate limits. Stopping batch processing.")
+                    print("  - Too many consecutive rate limits. API may be overloaded.")
+                    print("  - Stopping batch processing to avoid wasting resources.")
                     break
 
                 # Save progress before backing off
                 if current_page > start_page:
                     update_global_progress(session, current_page - 1)
 
-                print(f"  - Backing off for {RATE_LIMIT_BACKOFF} seconds...")
-                time.sleep(RATE_LIMIT_BACKOFF)
+                print(f"  - Backing off for {backoff_time} seconds (exponential backoff)...")
+                time.sleep(backoff_time)
                 # Don't increment current_page - retry the same page
                 continue
 
             r.raise_for_status()
             buildings_on_page = r.json()
 
-            # Reset error counter on successful request
+            # Reset error counters on successful request
             consecutive_errors = 0
+            page_retry_count = 0
 
             if not buildings_on_page:
                 print(f"\n  - Reached end of data at page {current_page}.")
@@ -369,53 +377,91 @@ def process_global_batch(session, start_page, existing_ids, start_time):
 
         except requests.exceptions.Timeout as e:
             consecutive_errors += 1
-            print(f"\n  - Timeout error fetching page {current_page}: {e}")
-            print(f"  - Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+            page_retry_count += 1
+
+            # Aggressive exponential backoff for timeouts: 10, 20, 40, 80, 160, 300 seconds (capped at 5 min)
+            # This gives the API more time to recover
+            backoff_time = min(10 * (2 ** (page_retry_count - 1)), 300)
+
+            print(f"\n  - Timeout error fetching page {current_page}")
+            print(f"  - Error: API not responding within {REQUEST_TIMEOUT}s")
+            print(f"  - Retry {page_retry_count} | Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
 
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                print("  - Too many consecutive errors. Stopping batch processing.")
+                print("  - Too many consecutive timeouts. API may be down or overloaded.")
+                print("  - Stopping batch processing. Will resume from this page on next run.")
+                # Save progress so we can resume from this page
+                if current_page > start_page:
+                    update_global_progress(session, current_page - 1)
                 break
 
             # Save progress before potentially failing
             if current_page > start_page:
                 update_global_progress(session, current_page - 1)
 
-            print("  - Waiting 5 seconds before retry...")
-            time.sleep(5)
+            print(f"  - Waiting {backoff_time} seconds before retry (exponential backoff)...")
+            time.sleep(backoff_time)
             # Don't increment current_page - retry the same page
 
         except requests.exceptions.ConnectionError as e:
             consecutive_errors += 1
-            print(f"\n  - Connection error fetching page {current_page}: {e}")
-            print(f"  - Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+            page_retry_count += 1
+
+            # Aggressive exponential backoff: 15, 30, 60, 120, 240, 300 seconds (capped at 5 min)
+            backoff_time = min(15 * (2 ** (page_retry_count - 1)), 300)
+
+            # Extract more specific error info
+            error_msg = str(e)
+            is_timeout = "Read timed out" in error_msg or "timeout" in error_msg.lower()
+
+            print(f"\n  - Connection error fetching page {current_page}")
+            if is_timeout:
+                print(f"  - Error type: Read timeout (API not responding within {REQUEST_TIMEOUT}s)")
+            else:
+                print(f"  - Error type: Connection failed")
+            print(f"  - Retry {page_retry_count} | Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
 
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                print("  - Too many consecutive errors. Stopping batch processing.")
+                print("  - Too many consecutive connection errors. API may be experiencing issues.")
+                print("  - Stopping batch processing. Will resume from this page on next run.")
+                # Save progress so we can resume from this page
+                if current_page > start_page:
+                    update_global_progress(session, current_page - 1)
                 break
 
             # Save progress before potentially failing
             if current_page > start_page:
                 update_global_progress(session, current_page - 1)
 
-            print("  - Waiting 10 seconds before retry...")
-            time.sleep(10)
+            print(f"  - Waiting {backoff_time} seconds before retry (exponential backoff)...")
+            time.sleep(backoff_time)
             # Don't increment current_page - retry the same page
 
         except requests.exceptions.RequestException as e:
             consecutive_errors += 1
-            print(f"\n  - Error fetching page {current_page}: {e}")
-            print(f"  - Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+            page_retry_count += 1
+
+            # Standard exponential backoff: 10, 20, 40, 80, 160, 300 seconds (capped at 5 min)
+            backoff_time = min(10 * (2 ** (page_retry_count - 1)), 300)
+
+            print(f"\n  - Request error fetching page {current_page}: {e}")
+            print(f"  - Retry {page_retry_count} | Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
 
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 print("  - Too many consecutive errors. Stopping batch processing.")
+                print("  - Will resume from this page on next run.")
+                # Save progress so we can resume from this page
+                if current_page > start_page:
+                    update_global_progress(session, current_page - 1)
                 break
 
             # Save progress before potentially failing
             if current_page > start_page:
                 update_global_progress(session, current_page - 1)
 
-            print("  - Skipping to next page...")
-            current_page += 1
+            print(f"  - Waiting {backoff_time} seconds before retry...")
+            time.sleep(backoff_time)
+            # Don't increment current_page - retry the same page
 
     return total_new_shelters, current_page - 1, False  # False = not complete
 
@@ -444,11 +490,14 @@ def main():
     current_cycle = get_current_cycle()
     last_page = progress.get('last_page', 0)
 
-    # Check if we've actually processed any pages this month
+    # Check if we should start a new cycle (if 30+ days have passed)
     if last_page > 0 and is_cycle_complete(progress.get('last_updated')):
-        print(f"Current cycle ({current_cycle}) is already complete.")
-        print("All pages have been processed this cycle.")
-        return
+        print(f"Previous cycle is complete (30+ days since last run).")
+        print(f"Starting new cycle ({current_cycle}) from page 0 to re-scan all buildings.")
+        # Reset to page 0 to start fresh cycle
+        last_page = 0
+        # Update the database to reflect new cycle start
+        update_global_progress(session, 0)
     elif last_page == 0:
         print(f"Starting new cycle ({current_cycle}) from page 0")
     else:
@@ -459,8 +508,8 @@ def main():
     if existing_ids is None:
         sys.exit("Could not fetch existing shelter IDs. Aborting.")
 
-    # Determine starting page
-    start_page = progress.get('last_page', 0) + 1
+    # Determine starting page (use the potentially updated last_page variable)
+    start_page = last_page + 1
 
     print(f"\nResuming from page {start_page}")
     print(f"Current cycle: {current_cycle}")
