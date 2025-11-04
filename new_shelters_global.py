@@ -122,8 +122,20 @@ def get_global_progress(session):
         if data:
             return data[0]
         else:
-            # Initialize if no record exists
-            return {"last_page": 0, "last_updated": None}
+            # Table exists but is empty - create initial record
+            print("Global progress table is empty. Creating initial record...")
+            insert_url = f"{SUPABASE_URL}/rest/v1/global_progress"
+            insert_data = {
+                "last_page": 0,
+                "last_updated": datetime.utcnow().isoformat()
+            }
+            r = session.post(insert_url, headers=HEADERS, json=insert_data, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
+            if r.status_code in [200, 201]:
+                print("✅ Initial progress record created successfully")
+                return {"last_page": 0, "last_updated": datetime.utcnow().isoformat()}
+            else:
+                print(f"⚠️ Could not create initial record (status: {r.status_code})")
+                return {"last_page": 0, "last_updated": None}
     except requests.exceptions.RequestException as e:
         if "404" in str(e):
             # Table doesn't exist, create it
@@ -173,8 +185,19 @@ def update_global_progress(session, page_number):
         r = session.get(url, headers=HEADERS, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         r.raise_for_status()
         data = r.json()
+
         if not data:
-            print("  - Warning: No global progress record found")
+            # No record exists, create one (INSERT)
+            insert_url = f"{SUPABASE_URL}/rest/v1/global_progress"
+            insert_data = {
+                "last_page": page_number,
+                "last_updated": datetime.utcnow().isoformat()
+            }
+            r = session.post(insert_url, headers=HEADERS, json=insert_data, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
+            if r.status_code in [200, 201]:
+                print(f"  - Created global progress record at page {page_number}")
+            else:
+                print(f"  - Warning: Could not create progress record (status: {r.status_code})")
             return
 
         record_id = data[0]['id']
