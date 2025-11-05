@@ -27,7 +27,8 @@ def test_cycle_logic():
     print(f"  Input: {recent_date}")
     print(f"  Result: {result}")
     print(f"  Expected: False")
-    print(f"  ✅ PASS" if not result else f"  ❌ FAIL")
+    assert not result, f"Cycle logic error: Recent update (5 days) should NOT be complete, but got {result}"
+    print(f"  ✅ PASS")
 
     # Test 2: Old update (33 days) - should be complete
     old_date = (datetime.now() - timedelta(days=33)).isoformat()
@@ -36,7 +37,8 @@ def test_cycle_logic():
     print(f"  Input: {old_date}")
     print(f"  Result: {result}")
     print(f"  Expected: True")
-    print(f"  ✅ PASS" if result else f"  ❌ FAIL")
+    assert result, f"Cycle logic error: Old update (33 days) SHOULD be complete, but got {result}"
+    print(f"  ✅ PASS")
 
     # Test 3: Exactly 30 days - should be complete
     exact_date = (datetime.now() - timedelta(days=30)).isoformat()
@@ -45,7 +47,8 @@ def test_cycle_logic():
     print(f"  Input: {exact_date}")
     print(f"  Result: {result}")
     print(f"  Expected: True")
-    print(f"  ✅ PASS" if result else f"  ❌ FAIL")
+    assert result, f"Cycle logic error: Exactly 30 days SHOULD be complete, but got {result}"
+    print(f"  ✅ PASS")
 
     # Test 4: None input - should NOT be complete
     result = is_cycle_complete(None)
@@ -53,7 +56,8 @@ def test_cycle_logic():
     print(f"  Input: None")
     print(f"  Result: {result}")
     print(f"  Expected: False")
-    print(f"  ✅ PASS" if not result else f"  ❌ FAIL")
+    assert not result, f"Cycle logic error: None input should NOT be complete, but got {result}"
+    print(f"  ✅ PASS")
 
     print()
 
@@ -83,7 +87,8 @@ def test_main_logic_scenarios():
 
     print(f"  Result: start_page = {start_page}")
     print(f"  Expected: start_page = 1")
-    print(f"  ✅ PASS" if start_page == 1 else f"  ❌ FAIL")
+    assert start_page == 1, f"Main logic error (Scenario 1): Expected start_page=1, got {start_page}"
+    print(f"  ✅ PASS")
 
     # Scenario 2: Recent run (stopped at page 32919, 2 days ago)
     print("\nScenario 2: Recent run (32919, 2 days ago)")
@@ -103,7 +108,8 @@ def test_main_logic_scenarios():
 
     print(f"  Result: start_page = {start_page}")
     print(f"  Expected: start_page = 32920")
-    print(f"  ✅ PASS" if start_page == 32920 else f"  ❌ FAIL")
+    assert start_page == 32920, f"Main logic error (Scenario 2): Expected start_page=32920, got {start_page}"
+    print(f"  ✅ PASS")
 
     # Scenario 3: Old run (stopped at page 32919, 33 days ago)
     print("\nScenario 3: Old run (32919, 33 days ago)")
@@ -123,7 +129,8 @@ def test_main_logic_scenarios():
 
     print(f"  Result: start_page = {start_page}")
     print(f"  Expected: start_page = 1")
-    print(f"  ✅ PASS" if start_page == 1 else f"  ❌ FAIL")
+    assert start_page == 1, f"Main logic error (Scenario 3): Expected start_page=1 (new cycle), got {start_page}"
+    print(f"  ✅ PASS")
 
     print()
 
@@ -141,7 +148,12 @@ def test_exponential_backoff():
 
     expected_timeout = [10, 20, 40, 80, 160, 300, 300]
     actual_timeout = [min(10 * (2 ** (retry - 1)), 300) for retry in range(1, 8)]
-    print(f"  ✅ PASS" if actual_timeout == expected_timeout else f"  ❌ FAIL")
+    assert actual_timeout == expected_timeout, (
+        f"Timeout backoff calculation incorrect:\n"
+        f"  Expected: {expected_timeout}\n"
+        f"  Got:      {actual_timeout}"
+    )
+    print(f"  ✅ PASS")
 
     # Test connection error backoff: 15, 30, 60, 120, 240, 300 (capped)
     print("\nConnection error backoff (15 * 2^(n-1), capped at 300):")
@@ -151,7 +163,12 @@ def test_exponential_backoff():
 
     expected_connection = [15, 30, 60, 120, 240, 300, 300]
     actual_connection = [min(15 * (2 ** (retry - 1)), 300) for retry in range(1, 8)]
-    print(f"  ✅ PASS" if actual_connection == expected_connection else f"  ❌ FAIL")
+    assert actual_connection == expected_connection, (
+        f"Connection error backoff calculation incorrect:\n"
+        f"  Expected: {expected_connection}\n"
+        f"  Got:      {actual_connection}"
+    )
+    print(f"  ✅ PASS")
 
     # Test rate limit backoff: 60, 120, 240, 300 (capped)
     print("\nRate limit backoff (60 * 2^(n-1), capped at 300):")
@@ -161,7 +178,12 @@ def test_exponential_backoff():
 
     expected_rate = [60, 120, 240, 300, 300]
     actual_rate = [min(60 * (2 ** (retry - 1)), 300) for retry in range(1, 6)]
-    print(f"  ✅ PASS" if actual_rate == expected_rate else f"  ❌ FAIL")
+    assert actual_rate == expected_rate, (
+        f"Rate limit backoff calculation incorrect:\n"
+        f"  Expected: {expected_rate}\n"
+        f"  Got:      {actual_rate}"
+    )
+    print(f"  ✅ PASS")
 
     print()
 

@@ -11,6 +11,7 @@ import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
+from typing import Optional, Dict, Any
 
 # Load environment variables
 load_dotenv()
@@ -29,11 +30,11 @@ PAGES_PER_BATCH = 278  # Pages per run (matching new_shelters_global.py)
 RUNS_PER_DAY = 3  # Number of runs per day
 CYCLE_DAYS = 30  # Days to complete a full cycle
 
-def get_current_cycle():
+def get_current_cycle() -> str:
     """Returns the current 30-day cycle identifier."""
     return datetime.now().strftime("%Y-%m-%d")
 
-def is_cycle_complete(last_updated):
+def is_cycle_complete(last_updated: Optional[str]) -> bool:
     """Determines if the current 30-day cycle is complete."""
     if not last_updated:
         return False
@@ -45,7 +46,7 @@ def is_cycle_complete(last_updated):
     except (ValueError, AttributeError):
         return False
 
-def fetch_global_progress():
+def fetch_global_progress() -> Optional[Dict[str, Any]]:
     """Fetches the current global progress from the database."""
     url = f"{SUPABASE_URL}/rest/v1/global_progress?select=last_page,last_updated&limit=1"
     try:
@@ -65,7 +66,7 @@ def fetch_global_progress():
             print(f"Error fetching global progress: {e}")
             return None
 
-def calculate_progress_stats(progress):
+def calculate_progress_stats(progress: Dict[str, Any]) -> Dict[str, Any]:
     """Calculates various progress statistics."""
     current_cycle = get_current_cycle()
     last_page = progress.get('last_page', 0)
@@ -106,7 +107,7 @@ def calculate_progress_stats(progress):
         'last_updated': last_updated
     }
 
-def print_progress_report(stats):
+def print_progress_report(stats: Dict[str, Any]) -> None:
     """Prints a comprehensive progress report."""
     print(f"\n{'='*80}")
     print(f"GLOBAL STRATEGY PROGRESS REPORT - {stats['current_cycle']}")
@@ -177,7 +178,7 @@ def print_progress_report(stats):
     
     print(f"\n{'='*80}")
 
-def main():
+def main() -> None:
     """Main function to run the global progress monitoring report."""
     print("Fetching global progress...")
     

@@ -32,6 +32,19 @@ DAR_API_URL = os.getenv("DAR_API_URL")
 DATAFORDELER_USERNAME = os.getenv("DATAFORDELER_USERNAME")
 DATAFORDELER_PASSWORD = os.getenv("DATAFORDELER_PASSWORD")
 
+# Validate that all required environment variables are set
+if not all([SUPABASE_URL, SUPABASE_KEY, BBR_API_URL, DAR_API_URL,
+            DATAFORDELER_USERNAME, DATAFORDELER_PASSWORD]):
+    sys.stderr.write("Error: One or more required environment variables are missing.\n")
+    sys.stderr.write("Please ensure your .env file contains all required values:\n")
+    sys.stderr.write("  - SUPABASE_URL\n")
+    sys.stderr.write("  - SUPABASE_KEY\n")
+    sys.stderr.write("  - BBR_API_URL\n")
+    sys.stderr.write("  - DAR_API_URL\n")
+    sys.stderr.write("  - DATAFORDELER_USERNAME\n")
+    sys.stderr.write("  - DATAFORDELER_PASSWORD\n")
+    sys.exit(1)
+
 # Global strategy configuration
 PAGES_PER_BATCH = 278  # Number of pages to process per run (3x daily for 60-day cycle)
                        # At ~4 seconds per page (3s sleep + 1s request), this is ~18 minutes per run

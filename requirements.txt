@@ -1,0 +1,12 @@
+# Core dependencies for Shelter Discovery & Audit System
+# Install with: pip install -r requirements.txt
+
+# HTTP requests and API interactions
+requests>=2.31.0,<3.0.0
+urllib3>=2.1.0,<3.0.0
+
+# Environment variable management
+python-dotenv>=1.0.0,<2.0.0
+
+# Note: All standard library modules used (datetime, time, sys, os, logging, typing)
+# are included with Python 3.10+ and require no installation.
