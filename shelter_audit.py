@@ -26,6 +26,10 @@ if not (SUPABASE_URL and SUPABASE_KEY and DATAFORDELER_USERNAME and DATAFORDELER
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# Timeout configuration
+CONNECT_TIMEOUT = 10  # Timeout for establishing connection
+REQUEST_TIMEOUT = 60  # Timeout for API requests
+
 # Requests session with retry/backoff
 session = requests.Session()
 retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -55,7 +59,7 @@ def fetch_all_shelters() -> List[Dict[str, Any]]:
     }
     url = f"{SUPABASE_URL}/rest/v1/sheltersv2"
     try:
-        r = session.get(url, headers=HEADERS, params=params)
+        r = session.get(url, headers=HEADERS, params=params, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         r.raise_for_status()
         shelters = r.json()
         if not isinstance(shelters, list):
@@ -75,7 +79,7 @@ def fetch_bbr_data(bygning_id: str) -> Optional[Dict[str, Any]]:
         "Id": bygning_id
     }
     try:
-        r = session.get(f"{BBR_API_URL}/bygning", params=params)
+        r = session.get(f"{BBR_API_URL}/bygning", params=params, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         r.raise_for_status()
         data = r.json()
         if isinstance(data, list) and data:
@@ -94,7 +98,7 @@ def fetch_dar_data(husnummer_id: str) -> Optional[Dict[str, Any]]:
         "id": husnummer_id
     }
     try:
-        r = session.get(f"{DAR_API_URL}/husnummer", params=params)
+        r = session.get(f"{DAR_API_URL}/husnummer", params=params, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         r.raise_for_status()
         data = r.json()
         if isinstance(data, list) and data:
@@ -108,7 +112,7 @@ def update_shelter(bygning_id: str, update_fields: Dict[str, Any]) -> bool:
     """Updates a shelter record in Supabase and logs detailed errors."""
     url = f"{SUPABASE_URL}/rest/v1/sheltersv2?bygning_id=eq.{bygning_id}"
     try:
-        r = session.patch(url, headers=HEADERS, json=update_fields)
+        r = session.patch(url, headers=HEADERS, json=update_fields, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
         r.raise_for_status()
         return True
     except requests.exceptions.HTTPError as e:

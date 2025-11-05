@@ -25,7 +25,8 @@ HEADERS = {
 
 # Configuration
 ESTIMATED_TOTAL_PAGES = 50000
-PAGES_PER_BATCH = 834  # Pages per run (matching new_shelters_global.py)
+PAGES_PER_BATCH = 278  # Pages per run (matching new_shelters_global.py)
+RUNS_PER_DAY = 3  # Number of runs per day
 CYCLE_DAYS = 30  # Days to complete a full cycle
 
 def get_current_cycle():
@@ -153,13 +154,12 @@ def print_progress_report(stats):
     else:
         if stats['pages_remaining'] > 0:
             print(f"   • {stats['pages_remaining']:,} pages remaining in this cycle")
-            
+
             # Estimate completion time
-            if stats['time_since_update'] and stats['time_since_update'].total_seconds() > 0:
-                pages_per_day = ESTIMATED_TOTAL_PAGES // CYCLE_DAYS
-                days_to_complete = stats['pages_remaining'] / pages_per_day
-                print(f"   • Estimated {days_to_complete:.1f} days to complete at current rate")
-            
+            pages_per_day = PAGES_PER_BATCH * RUNS_PER_DAY
+            days_to_complete = stats['pages_remaining'] / pages_per_day
+            print(f"   • Estimated {days_to_complete:.1f} days to complete at current rate ({pages_per_day:,} pages/day)")
+
             print(f"   • Continue running the global strategy to complete the cycle")
         else:
             print(f"   • All estimated pages have been processed")
@@ -170,7 +170,8 @@ def print_progress_report(stats):
     
     # Performance Tips
     print(f"\n🚀 PERFORMANCE TIPS:")
-    print(f"   • Run daily to process {PAGES_PER_BATCH} pages per day")
+    print(f"   • Currently running {RUNS_PER_DAY}x daily to process {PAGES_PER_BATCH * RUNS_PER_DAY:,} pages per day")
+    print(f"   • Each run processes {PAGES_PER_BATCH} pages with 3-second intervals between requests")
     print(f"   • With {ESTIMATED_TOTAL_PAGES:,} total pages, aim for ~{ESTIMATED_TOTAL_PAGES//CYCLE_DAYS:,} pages per day")
     print(f"   • Adjust PAGES_PER_BATCH in new_shelters_global.py if needed")
     

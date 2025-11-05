@@ -52,7 +52,7 @@ jobs:
           DATAFORDELER_PASSWORD: ${{ secrets.DATAFORDELER_PASSWORD }}
         run: |
           echo "Starting global shelter discovery..."
-          echo "Processing 834 pages per run (once daily for 60-day completion)"
+          echo "Processing 278 pages per run (3x daily for 60-day completion)"
           python new_shelters_global.py
 
       - name: Monitor Progress
