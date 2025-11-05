@@ -33,8 +33,8 @@ DATAFORDELER_USERNAME = os.getenv("DATAFORDELER_USERNAME")
 DATAFORDELER_PASSWORD = os.getenv("DATAFORDELER_PASSWORD")
 
 # Global strategy configuration
-PAGES_PER_BATCH = 834  # Number of pages to process per run (optimized for once-daily 60-day cycle)
-                       # At ~2 seconds per page (1s sleep + 1s request), this is ~28 minutes per run
+PAGES_PER_BATCH = 278  # Number of pages to process per run (3x daily for 60-day cycle)
+                       # At ~4 seconds per page (3s sleep + 1s request), this is ~18 minutes per run
 CYCLE_DAYS = 30  # Days to complete a full cycle
 ESTIMATED_TOTAL_PAGES = 50000  # Rough estimate of total pages across Denmark
 
@@ -49,7 +49,7 @@ REQUEST_TIMEOUT = 60  # Timeout for API requests (increased from 30s)
 CONNECT_TIMEOUT = 20  # Timeout for establishing connection (increased from 10s)
 
 # Rate limiting configuration
-API_SLEEP_TIME = 1.0  # Seconds to wait between requests (increased for API limits)
+API_SLEEP_TIME = 3.0  # Seconds to wait between requests (more respectful to API)
 RATE_LIMIT_BACKOFF = 60  # Seconds to wait when hitting rate limits
 
 HEADERS = {

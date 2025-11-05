@@ -2,8 +2,10 @@ name: Shelter Discovery & Audit
 
 on:
   schedule:
-    # Run shelter discovery once daily at 02:00 UTC
-    - cron: '0 2 * * *'
+    # Run shelter discovery 3x daily (distributed across day for API stability)
+    - cron: '0 2 * * *'   # 02:00 UTC (04:00 CET)
+    - cron: '0 10 * * *'  # 10:00 UTC (12:00 CET)
+    - cron: '0 18 * * *'  # 18:00 UTC (20:00 CET)
     # Run shelter audit weekly on Sundays at 03:00 UTC
     - cron: '0 3 * * 0'
   workflow_dispatch:
