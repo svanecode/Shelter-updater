@@ -31,9 +31,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          DAR_API_URL: ${{ secrets.DAR_API_URL }}
-          DATAFORDELER_USERNAME: ${{ secrets.DATAFORDELER_USERNAME }}
-          DATAFORDELER_PASSWORD: ${{ secrets.DATAFORDELER_PASSWORD }}
           DATAFORDELER_API_KEY: ${{ secrets.DATAFORDELER_API_KEY }}
         run: |
           echo "Starting GraphQL Shelter Sync..."
