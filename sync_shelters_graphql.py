@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""
+Shelter Sync via GraphQL
+
+This script synchronizes shelters from Datafordeler BBR GraphQL API to Supabase.
+It performs a full synchronization of all active shelters (status 6).
+
+Features:
+- Fetches all shelters with status 6 (Civil Defense) from BBR GraphQL.
+- Compares with existing Supabase records to minimize writes.
+- Fetches detailed address data from DAR for new shelters.
+- Soft-deletes shelters that are no longer present in BBR.
+- Resurrects soft-deleted shelters if they reappear.
+"""
+
+import os
+import sys
+import time
+import requests
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Set, Optional
+from dotenv import load_dotenv
+
+# --- Configuration ---
+load_dotenv()
+
+# Environment Variables
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+DATAFORDELER_API_KEY = os.getenv("DATAFORDELER_API_KEY")
+
+# Validation
+def validate_env():
+    required_vars = [
+        "SUPABASE_URL", "SUPABASE_KEY", "DATAFORDELER_API_KEY"
+    ]
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if missing_vars:
+        print(f"CRITICAL: Missing environment variables: {', '.join(missing_vars)}")
+        sys.exit(1)
+
+BBR_GRAPHQL_URL = "https://graphql.datafordeler.dk/BBR/v1"
+
+# Tuning parameters
+BATCH_SIZE = 1 # Update immediately (no bulk)
+DAR_SLEEP_TIME = 0.1 # Throttle DAR requests
+GRAPHQL_PAGE_SLEEP = 0.2 # Throttle GraphQL pages
+PAGE_SIZE = 500 # GraphQL objects per page
+ADDRESS_REFRESH_DAYS = 90 # Re-fetch address if data is older than this
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("ShelterSync")
+
+HEADERS_SUPABASE = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=merge-duplicates",
+}
+
+def fetch_existing_state() -> Dict[str, Dict[str, Any]]:
+    """
+    Loads all existing shelter IDs and their state from Supabase.
+    Returns a dict mapped by bygning_id.
+    """
+    logger.info("Fetching existing state from Supabase...")
+    state = {}
+    offset = 0
+    limit = 1000 # Set to 1000 to match Supabase default max rows
+    session = requests.Session()
+    session.headers.update(HEADERS_SUPABASE)
+    
+    while True:
+        headers = {"Range": f"{offset}-{offset + limit - 1}"}
+        # Select location to check if we need to backfill coordinates
+        url = f"{SUPABASE_URL}/rest/v1/sheltersv2?select=id,bygning_id,shelter_capacity,deleted,last_checked,location&order=id.asc"
+        try:
+            r = session.get(url, headers=headers, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            if not data: break
+            
+            for item in data:
+                bid = item.get('bygning_id')
+                if bid:
+                    state[bid] = {
+                        'id': item['id'],
+                        'capacity': item.get('shelter_capacity'),
+                        'deleted': item.get('deleted') is not None,
+                        'last_checked': item.get('last_checked'),
+                        'location': item.get('location')
+                    }
+            
+            if len(data) < limit: break
+            offset += limit
+            print(f"  Loaded {len(state)} records...", end='\r')
+        except Exception as e:
+            logger.error(f"Error fetching state: {e}")
+            sys.exit(1)
+            
+    print() # Clear line
+    logger.info(f"Total loaded: {len(state)} records.")
+    return state
+
+def fetch_address_data(husnummer_id: str) -> Dict[str, Any]:
+    """
+    Fetches address details and WGS84 coordinates from DAWA (Dataforsyningen).
+    Replaces the old Datafordeler DAR lookup to get proper GeoJSON coordinates.
+    """
+    if not husnummer_id: return {}
+    
+    url = f"https://api.dataforsyningen.dk/adgangsadresser/{husnummer_id}"
+    
+    try:
+        # Retry logic
+        for attempt in range(3):
+            try:
+                r = requests.get(url, timeout=10)
+                if r.status_code == 404:
+                    # Address ID not found in DAWA (might be obsolete)
+                    return {}
+                if r.status_code == 429:
+                    time.sleep(1 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                
+                # Extract Address Components
+                # Note: 'navngivenvej' only contains href/id. Street name is in 'vejstykke'.
+                vej = data.get('vejstykke', {})
+                post = data.get('postnummer', {})
+                husnr = data.get('husnr')
+                
+                # Extract Coordinates (WGS84: [lon, lat])
+                coords = data.get('adgangspunkt', {}).get('koordinater')
+                location_geojson = None
+                if coords and len(coords) == 2:
+                    location_geojson = {
+                        "type": "Point",
+                        "coordinates": coords # DAWA returns [lon, lat]
+                    }
+
+                return {
+                    "address": data.get('adressebetegnelse'),
+                    "vejnavn": vej.get('navn'),
+                    "husnummer": husnr,
+                    "postnummer": post.get('nr'),
+                    "location": location_geojson
+                }
+            except requests.exceptions.RequestException:
+                if attempt == 2: raise
+                time.sleep(0.5)
+        return {}
+    except Exception as e:
+        logger.warning(f"Failed to fetch address data for {husnummer_id}: {e}")
+        return {}
+
+def should_refresh_address(last_checked_str: Optional[str]) -> bool:
+    """Returns True if the record hasn't been updated/checked in a long time."""
+    if not last_checked_str: return True
+    try:
+        # Robust parsing: Take first 19 chars (YYYY-MM-DDTHH:MM:SS) ignoring fractional/TZ
+        # This avoids python version differences with isoformat
+        clean_ts = last_checked_str[:19]
+        last_checked = datetime.fromisoformat(clean_ts)
+        days_diff = (datetime.utcnow() - last_checked).days
+        return days_diff > ADDRESS_REFRESH_DAYS
+    except ValueError as e:
+        logger.warning(f"Date parse error for {last_checked_str}: {e} -> Forcing refresh.")
+        return True
+
+def save_cursor(cursor: Optional[str]):
+    """Saves the current GraphQL cursor to Supabase."""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/sync_state?id=eq.1"
+        data = {"cursor": cursor, "last_run": datetime.utcnow().isoformat()}
+        requests.patch(url, headers=HEADERS_SUPABASE, json=data, timeout=10)
+    except Exception as e:
+        logger.warning(f"Failed to save cursor: {e}")
+
+def get_saved_cursor() -> Optional[str]:
+    """Retrieves the last saved cursor."""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/sync_state?id=eq.1&select=cursor"
+        r = requests.get(url, headers=HEADERS_SUPABASE, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data: return data[0].get('cursor')
+    except Exception as e:
+        logger.warning(f"Failed to get cursor: {e}")
+    return None
+
+def sync():
+    validate_env()
+    logger.info("Starting GraphQL Sync...")
+    
+    # Try to resume
+    saved_cursor = get_saved_cursor()
+    if saved_cursor:
+        logger.info(f"Resuming from saved cursor: {saved_cursor[:10]}...")
+        after = saved_cursor
+    else:
+        after = None
+
+    existing_state = fetch_existing_state()
+    
+    seen_ids = set()
+    stats = {"new": 0, "updated": 0, "restored": 0, "unchanged": 0, "deleted": 0, "address_refreshed": 0}
+    
+    # Time variable for GraphQL (Datafordeler expects strict ISO8601)
+    now_ts = datetime.utcnow().isoformat(timespec='seconds') + "Z"
+    
+    query = """
+    query GetShelters($now: DafDateTime, $after: String, $first: Int) {
+      BBR_Bygning(
+        first: $first, 
+        after: $after,
+        registreringstid: $now, 
+        virkningstid: $now,
+        where: { 
+          status: { eq: \"6\" }
+        }
+      ) {
+        nodes {
+          id_lokalId
+          byg069Sikringsrumpladser
+          byg021BygningensAnvendelse
+          kommunekode
+          husnummer
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+    """
+    
+    has_next = True
+    completed_successfully = False
+    
+    insert_queue_full = []
+    insert_queue_partial = []
+    
+    session = requests.Session()
+    
+    while has_next:
+        try:
+            payload = {
+                'query': query, 
+                'variables': {"now": now_ts, "after": after, "first": PAGE_SIZE}
+            }
+            
+            r = session.post(
+                BBR_GRAPHQL_URL, 
+                json=payload,
+                params={"apikey": DATAFORDELER_API_KEY},
+                timeout=45
+            )
+            
+            if r.status_code != 200:
+                logger.error(f"GraphQL Error (Status {r.status_code}): {r.text}")
+                # Backoff and retry current page?
+                time.sleep(5)
+                continue
+                
+            res_data = r.json()
+            
+            if "errors" in res_data:
+                logger.error(f"GraphQL API Errors: {res_data['errors']}")
+                break
+                
+            data_block = res_data.get('data', {}).get('BBR_Bygning', {})
+            nodes = data_block.get('nodes', [])
+            page_info = data_block.get('pageInfo', {})
+            
+            for node in nodes:
+                # FILTER: Only valid capacity
+                cap_val = node.get('byg069Sikringsrumpladser')
+                if not cap_val or int(cap_val) <= 0:
+                    continue
+
+                bygning_id = node['id_lokalId']
+                capacity = int(cap_val)
+                seen_ids.add(bygning_id)
+                
+                curr = existing_state.get(bygning_id)
+                record_update = {}
+                
+                needs_address = False
+                action = "none"
+
+                if not curr:
+                    # NEW RECORD
+                    action = f"new (Cap: {capacity})"
+                    stats["new"] += 1
+                    needs_address = True
+                    logger.info(f"  [NEW] {bygning_id} (Cap: {capacity})")
+                
+                else:
+                    # EXISTING RECORD
+                    has_missing_location = curr.get('location') is None
+
+                    if curr['deleted']:
+                        action = "restored (was deleted)"
+                        stats["restored"] += 1
+                        record_update = {"deleted": None}
+                        needs_address = True # Fetch address to ensure restored record is complete
+                        logger.info(f"  [RESTORED] {bygning_id}")
+                    
+                    elif curr['capacity'] != capacity:
+                        action = f"updated: Cap {curr['capacity']} -> {capacity}"
+                        stats["updated"] += 1
+                        logger.info(f"  [UPDATED] {bygning_id}: Cap {curr['capacity']} -> {capacity}")
+                    
+                    elif should_refresh_address(curr.get('last_checked')) or has_missing_location:
+                        reason = "missing_loc" if has_missing_location else "stale"
+                        action = f"refresh_addr ({reason}, last: {curr.get('last_checked')})"
+                        stats["address_refreshed"] += 1
+                        needs_address = True
+                    
+                    else:
+                        stats["unchanged"] += 1
+                        continue # Skip upsert if absolutely nothing changed
+
+                # Prepare the record
+                record_update["_action"] = action # Store action for logging
+
+                if "new" in action or needs_address:
+                    addr_data = fetch_address_data(node.get('husnummer'))
+                    time.sleep(DAR_SLEEP_TIME) # Polite throttling
+                    
+                    record_update.update({
+                        "bygning_id": bygning_id,
+                        "shelter_capacity": capacity,
+                        "anvendelse": node.get('byg021BygningensAnvendelse'),
+                        "kommunekode": node.get('kommunekode'),
+                        "address": addr_data.get("address"),
+                        "postnummer": addr_data.get("postnummer"),
+                        "vejnavn": addr_data.get("vejnavn"),
+                        "husnummer": addr_data.get("husnummer"),
+                        "location": addr_data.get("location"),
+                        "last_checked": datetime.utcnow().isoformat()
+                    })
+                    insert_queue_full.append(record_update)
+                else:
+                    # Minimal update
+                    record_update.update({
+                        "bygning_id": bygning_id,
+                        "shelter_capacity": capacity,
+                        "last_checked": datetime.utcnow().isoformat()
+                    })
+                    insert_queue_partial.append(record_update)
+                
+                # Flush queues
+                if len(insert_queue_full) >= BATCH_SIZE:
+                    upsert_to_supabase(insert_queue_full)
+                    insert_queue_full = []
+                
+                if len(insert_queue_partial) >= BATCH_SIZE:
+                    upsert_to_supabase(insert_queue_partial)
+                    insert_queue_partial = []
+
+            has_next = page_info.get('hasNextPage', False)
+            after = page_info.get('endCursor')
+            
+            # SAVE PROGRESS
+            save_cursor(after)
+            
+            if not has_next:
+                completed_successfully = True
+                save_cursor(None) # Clear cursor on success
+            
+            # Rate limiting for GraphQL
+            time.sleep(GRAPHQL_PAGE_SLEEP)
+
+        except KeyboardInterrupt:
+            logger.warning("Sync interrupted by user.")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Unexpected error during sync loop: {e}")
+            break
+
+    # Flush remaining inserts
+    if insert_queue_full:
+        upsert_to_supabase(insert_queue_full)
+    if insert_queue_partial:
+        upsert_to_supabase(insert_queue_partial)
+        
+    # --- DELETION PHASE ---
+    # Only proceed if we scanned a significant number of records to avoid wiping DB on API failure
+    SAFE_THRESHOLD = 500
+    
+    if completed_successfully and len(seen_ids) > SAFE_THRESHOLD:
+        logger.info("Processing deletions...")
+        to_delete = []
+        
+        for bid, data in existing_state.items():
+            if not data['deleted'] and bid not in seen_ids:
+                to_delete.append(data['id']) # Use internal ID for faster deletion if mapped
+        
+        stats["deleted"] = len(to_delete)
+        
+        if to_delete:
+            logger.info(f"Marking {len(to_delete)} records as deleted...")
+            soft_delete_in_supabase(to_delete)
+    else:
+        if not completed_successfully:
+            logger.warning("Skipping deletion phase: Scan did not complete successfully.")
+        else:
+            logger.warning(f"Skipping deletion phase: Too few records found ({len(seen_ids)}). Possible API issue.")
+        
+    logger.info("Sync complete.")
+    logger.info(f"Summary: New: {stats['new']}, Updated: {stats['updated']}, Restored: {stats['restored']}, Deleted: {stats['deleted']}, Address Refreshed: {stats['address_refreshed']}, Unchanged: {stats['unchanged']}")
+
+def upsert_to_supabase(batch: List[Dict]):
+    if not batch: return
+
+    # Normalize batch: Ensure all items have the same keys
+    normalized_batch = []
+    action_map = {} # Map ID to action for logging
+
+    for item in batch:
+        new_item = item.copy()
+        
+        # Extract and remove internal metadata
+        if "_action" in new_item:
+            action_map[new_item['bygning_id']] = new_item.pop("_action")
+            
+        normalized_batch.append(new_item)
+
+    # Re-scan keys after removing _action
+    all_keys = set().union(*(d.keys() for d in normalized_batch))
+    
+    final_batch = []
+    for item in normalized_batch:
+        for key in all_keys:
+            if key not in item:
+                item[key] = None
+        final_batch.append(item)
+
+    url = f"{SUPABASE_URL}/rest/v1/sheltersv2?on_conflict=bygning_id"
+    try:
+        # Explicitly specify the conflict column for upsert
+        r = requests.post(url, headers=HEADERS_SUPABASE, json=final_batch, timeout=30)
+        r.raise_for_status()
+        
+        if len(batch) == 1:
+            bid = batch[0].get('bygning_id')
+            act = action_map.get(bid, "unknown")
+            logger.info(f"Successfully saved shelter {bid} (Reason: {act})")
+        else:
+            logger.info(f"Successfully saved batch of {len(batch)} records.")
+    except Exception as e:
+        logger.error(f"Batch upsert failed: {e}")
+        if 'r' in locals() and hasattr(r, 'text'):
+            logger.error(f"Response text: {r.text}")
+        
+        # Fallback: Try one by one
+        logger.info("Retrying batch one by one...")
+        for item in batch:
+            try:
+                # Try full update first
+                r_single = requests.post(url, headers=HEADERS_SUPABASE, json=[item], timeout=10)
+                r_single.raise_for_status()
+            except Exception as single_e:
+                logger.warning(f"Failed to upsert item {item.get('bygning_id')}: {single_e}")
+                
+                # EMERGENCY FALLBACK: Minimal update (Fixes FK violations preventing restore)
+                try:
+                    minimal_item = {
+                        "bygning_id": item["bygning_id"],
+                        "shelter_capacity": item.get("shelter_capacity"),
+                        "last_checked": item.get("last_checked"),
+                        "deleted": None, # Force un-delete
+                        # Force clear potential bad FKs to allow save
+                        "anvendelse": None, 
+                        "kommunekode": None 
+                    }
+                    logger.info(f"  Attempting minimal recovery for {item.get('bygning_id')}...")
+                    r_min = requests.post(url, headers=HEADERS_SUPABASE, json=[minimal_item], timeout=10)
+                    r_min.raise_for_status()
+                    logger.info("  Success: Minimal recovery saved.")
+                except Exception as min_e:
+                    logger.error(f"  Critical: Could not save record even with minimal data: {min_e}")
+                    if hasattr(r_single, 'text'):
+                        logger.error(f"  Original Error: {r_single.text}")
+        # If batch fails, we could try one by one, but for now just log it.
+
+def soft_delete_in_supabase(ids: List[str]):
+    chunk_size = 100
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i:i + chunk_size]
+        # Assuming 'id' is the primary key (UUID) or int. If 'id' is distinct from 'bygning_id'.
+        # The existing state stored 'id' (supabase PK) which is safer.
+        url = f"{SUPABASE_URL}/rest/v1/sheltersv2?id=in.({','.join(map(str, chunk))})"
+        try:
+            r = requests.patch(
+                url, 
+                headers=HEADERS_SUPABASE, 
+                json={"deleted": datetime.utcnow().isoformat()},
+                timeout=30
+            )
+            r.raise_for_status()
+        except Exception as e:
+            logger.error(f"Supabase delete error: {e}")
+
+if __name__ == "__main__":
+    sync()
