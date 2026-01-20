@@ -39,11 +39,20 @@ Create a `.env` file with the following:
 ```env
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your_service_role_key
+DATAFORDELER_API_KEY=your_api_key
+```
 
-DAR_API_URL=https://services.datafordeler.dk/DAR/DAR/1/rest
-DATAFORDELER_USERNAME=your_username
-DATAFORDELER_PASSWORD=your_password
-DATAFORDELER_API_KEY=your_api_key (for GraphQL)
+Optional tuning variables:
+
+```env
+ADDRESS_REFRESH_DAYS=90
+PAGE_SIZE=500
+GRAPHQL_PAGE_SLEEP=0.2
+DAR_SLEEP_TIME=0.1
+MAX_GRAPHQL_RETRIES=8
+GRAPHQL_RETRY_BASE_SLEEP=5
+SAFE_THRESHOLD=500
+MIN_DELETE_COVERAGE=0.8
 ```
 
 ### Running Locally

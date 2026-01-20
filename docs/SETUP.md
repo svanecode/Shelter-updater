@@ -7,7 +7,6 @@ This guide explains how to set up the GraphQL-based Shelter Sync system.
 ### Accounts & Access
 1.  **Supabase:** Create a project and get your `URL` and `service_role` key.
 2.  **Datafordeler:** Register at [datafordeler.dk](https://datafordeler.dk).
-    *   You need a **Tjenestebruger** (Service User) username/password.
     *   You need an **API Key** (Web-service nøgle) for GraphQL access.
 
 ## 2. Local Setup
@@ -28,10 +27,17 @@ cp .env.example .env
 Fill in the following variables:
 *   `SUPABASE_URL`: Your Supabase project URL.
 *   `SUPABASE_KEY`: Your Supabase `service_role` key.
-*   `DAR_API_URL`: `https://services.datafordeler.dk/DAR/DAR/1/rest`
-*   `DATAFORDELER_USERNAME`: Your Datafordeler service username.
-*   `DATAFORDELER_PASSWORD`: Your Datafordeler service password.
 *   `DATAFORDELER_API_KEY`: Your Datafordeler GraphQL API Key.
+
+Optional tuning variables:
+*   `ADDRESS_REFRESH_DAYS`: Days before refreshing address data (default 90).
+*   `PAGE_SIZE`: GraphQL page size (default 500).
+*   `GRAPHQL_PAGE_SLEEP`: Delay between pages in seconds (default 0.2).
+*   `DAR_SLEEP_TIME`: Delay between address lookups in seconds (default 0.1).
+*   `MAX_GRAPHQL_RETRIES`: Retries per GraphQL page (default 8).
+*   `GRAPHQL_RETRY_BASE_SLEEP`: Backoff base seconds (default 5).
+*   `SAFE_THRESHOLD`: Minimum seen records before deletions (default 500).
+*   `MIN_DELETE_COVERAGE`: Minimum coverage ratio for deletions (default 0.8).
 
 ## 3. Database Setup
 
@@ -55,8 +61,10 @@ The repository is pre-configured with a GitHub Action (`.github/workflows/shelte
 
 To enable it:
 1.  Go to your GitHub Repository **Settings** -> **Secrets and variables** -> **Actions**.
-2.  Add all 6 environment variables from your `.env` as **Secrets**.
+2.  Add the required environment variables from your `.env` as **Secrets**.
 3.  Ensure Actions are enabled in the **Actions** tab.
+
+The workflow also uploads a `sync_summary.json` artifact and writes a summary to the GitHub Actions job summary.
 
 ## 5. Troubleshooting
 

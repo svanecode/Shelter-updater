@@ -16,6 +16,8 @@ Features:
 import os
 import sys
 import time
+import random
+import json
 import requests
 import logging
 from datetime import datetime, timedelta
@@ -44,10 +46,15 @@ BBR_GRAPHQL_URL = "https://graphql.datafordeler.dk/BBR/v1"
 
 # Tuning parameters
 BATCH_SIZE = 1 # Update immediately (no bulk)
-DAR_SLEEP_TIME = 0.1 # Throttle DAR requests
-GRAPHQL_PAGE_SLEEP = 0.2 # Throttle GraphQL pages
-PAGE_SIZE = 500 # GraphQL objects per page
-ADDRESS_REFRESH_DAYS = 90 # Re-fetch address if data is older than this
+DAR_SLEEP_TIME = float(os.getenv("DAR_SLEEP_TIME", "0.1")) # Throttle DAR requests
+GRAPHQL_PAGE_SLEEP = float(os.getenv("GRAPHQL_PAGE_SLEEP", "0.2")) # Throttle GraphQL pages
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "500")) # GraphQL objects per page
+ADDRESS_REFRESH_DAYS = int(os.getenv("ADDRESS_REFRESH_DAYS", "90")) # Re-fetch address if data is older than this
+MAX_GRAPHQL_RETRIES = int(os.getenv("MAX_GRAPHQL_RETRIES", "8")) # Max retries per page
+GRAPHQL_RETRY_BASE_SLEEP = int(os.getenv("GRAPHQL_RETRY_BASE_SLEEP", "5")) # Base backoff for retryable errors (seconds)
+SAFE_THRESHOLD = int(os.getenv("SAFE_THRESHOLD", "500"))
+MIN_DELETE_COVERAGE = float(os.getenv("MIN_DELETE_COVERAGE", "0.8"))
+SUMMARY_PATH = os.getenv("SUMMARY_PATH")
 
 # Logging setup
 logging.basicConfig(
@@ -80,29 +87,37 @@ def fetch_existing_state() -> Dict[str, Dict[str, Any]]:
         headers = {"Range": f"{offset}-{offset + limit - 1}"}
         # Select location to check if we need to backfill coordinates
         url = f"{SUPABASE_URL}/rest/v1/sheltersv2?select=id,bygning_id,shelter_capacity,deleted,last_checked,location&order=id.asc"
-        try:
-            r = session.get(url, headers=headers, timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            if not data: break
-            
-            for item in data:
-                bid = item.get('bygning_id')
-                if bid:
-                    state[bid] = {
-                        'id': item['id'],
-                        'capacity': item.get('shelter_capacity'),
-                        'deleted': item.get('deleted') is not None,
-                        'last_checked': item.get('last_checked'),
-                        'location': item.get('location')
-                    }
-            
-            if len(data) < limit: break
-            offset += limit
-            print(f"  Loaded {len(state)} records...", end='\r')
-        except Exception as e:
-            logger.error(f"Error fetching state: {e}")
-            sys.exit(1)
+        data = None
+        for attempt in range(1, 4):
+            try:
+                r = session.get(url, headers=headers, timeout=60)
+                r.raise_for_status()
+                data = r.json()
+                break
+            except Exception as e:
+                if attempt == 3:
+                    logger.error(f"Error fetching state: {e}")
+                    sys.exit(1)
+                time.sleep(2 * attempt)
+
+        if not data:
+            break
+
+        for item in data:
+            bid = item.get('bygning_id')
+            if bid:
+                state[bid] = {
+                    'id': item['id'],
+                    'capacity': item.get('shelter_capacity'),
+                    'deleted': item.get('deleted') is not None,
+                    'last_checked': item.get('last_checked'),
+                    'location': item.get('location')
+                }
+
+        if len(data) < limit:
+            break
+        offset += limit
+        print(f"  Loaded {len(state)} records...", end='\r')
             
     print() # Clear line
     logger.info(f"Total loaded: {len(state)} records.")
@@ -211,7 +226,15 @@ def sync():
     existing_state = fetch_existing_state()
     
     seen_ids = set()
-    stats = {"new": 0, "updated": 0, "restored": 0, "unchanged": 0, "deleted": 0, "address_refreshed": 0}
+    stats = {
+        "new": 0,
+        "updated": 0,
+        "restored": 0,
+        "unchanged": 0,
+        "deleted": 0,
+        "address_refreshed": 0,
+        "missing_location": 0
+    }
     
     # Time variable for GraphQL (Datafordeler expects strict ISO8601)
     now_ts = datetime.utcnow().isoformat(timespec='seconds') + "Z"
@@ -244,42 +267,79 @@ def sync():
     
     has_next = True
     completed_successfully = False
+    graphql_had_errors = False
+    graphql_error_count = 0
+    page_index = 0
     
     insert_queue_full = []
     insert_queue_partial = []
     
     session = requests.Session()
     
+    def post_graphql_with_retry(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        for attempt in range(1, MAX_GRAPHQL_RETRIES + 1):
+            try:
+                r = session.post(
+                    BBR_GRAPHQL_URL,
+                    json=payload,
+                    params={"apikey": DATAFORDELER_API_KEY},
+                    timeout=45
+                )
+
+                if r.status_code == 200:
+                    res_data = r.json()
+                    if "errors" in res_data:
+                        logger.error(f"GraphQL API Errors: {res_data['errors']}")
+                        raise RuntimeError("GraphQL errors returned in response.")
+                    return res_data
+
+                if r.status_code in {429, 500, 502, 503, 504}:
+                    logger.warning(
+                        f"GraphQL transient error (Status {r.status_code}), retry {attempt}/{MAX_GRAPHQL_RETRIES}..."
+                    )
+                else:
+                    logger.error(f"GraphQL Error (Status {r.status_code}): {r.text}")
+                    return None
+            except Exception as e:
+                logger.warning(f"GraphQL request failed (attempt {attempt}): {e}")
+
+            backoff = GRAPHQL_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
+            jitter = random.uniform(0, 1.0)
+            time.sleep(backoff + jitter)
+
+        logger.error("GraphQL request failed after max retries.")
+        return None
+
     while has_next:
         try:
             payload = {
                 'query': query, 
                 'variables': {"now": now_ts, "after": after, "first": PAGE_SIZE}
             }
-            
-            r = session.post(
-                BBR_GRAPHQL_URL, 
-                json=payload,
-                params={"apikey": DATAFORDELER_API_KEY},
-                timeout=45
-            )
-            
-            if r.status_code != 200:
-                logger.error(f"GraphQL Error (Status {r.status_code}): {r.text}")
-                # Backoff and retry current page?
-                time.sleep(5)
-                continue
-                
-            res_data = r.json()
-            
-            if "errors" in res_data:
-                logger.error(f"GraphQL API Errors: {res_data['errors']}")
+
+            res_data = post_graphql_with_retry(payload)
+            if res_data is None:
+                graphql_had_errors = True
+                graphql_error_count += 1
+                logger.error(
+                    "GraphQL failed for page "
+                    f"{page_index} (cursor={after}, seen={len(seen_ids)})"
+                )
                 break
                 
             data_block = res_data.get('data', {}).get('BBR_Bygning', {})
             nodes = data_block.get('nodes', [])
             page_info = data_block.get('pageInfo', {})
             
+            page_index += 1
+            logger.info(
+                "GraphQL page %s: nodes=%s, seen=%s, cursor=%s",
+                page_index,
+                len(nodes),
+                len(seen_ids),
+                after
+            )
+
             for node in nodes:
                 # FILTER: Only valid capacity
                 cap_val = node.get('byg069Sikringsrumpladser')
@@ -335,6 +395,8 @@ def sync():
                 if "new" in action or needs_address:
                     addr_data = fetch_address_data(node.get('husnummer'))
                     time.sleep(DAR_SLEEP_TIME) # Polite throttling
+                    if addr_data.get("location") is None:
+                        stats["missing_location"] += 1
                     
                     record_update.update({
                         "bygning_id": bygning_id,
@@ -372,6 +434,13 @@ def sync():
             
             # SAVE PROGRESS
             save_cursor(after)
+
+            logger.info(
+                "Page complete %s: has_next=%s, next_cursor=%s",
+                page_index,
+                has_next,
+                after
+            )
             
             if not has_next:
                 completed_successfully = True
@@ -395,9 +464,10 @@ def sync():
         
     # --- DELETION PHASE ---
     # Only proceed if we scanned a significant number of records to avoid wiping DB on API failure
-    SAFE_THRESHOLD = 500
+    active_existing = sum(1 for data in existing_state.values() if not data.get('deleted'))
+    min_seen_required = max(SAFE_THRESHOLD, int(active_existing * MIN_DELETE_COVERAGE))
     
-    if completed_successfully and len(seen_ids) > SAFE_THRESHOLD:
+    if completed_successfully and not graphql_had_errors and len(seen_ids) >= min_seen_required:
         logger.info("Processing deletions...")
         to_delete = []
         
@@ -413,11 +483,61 @@ def sync():
     else:
         if not completed_successfully:
             logger.warning("Skipping deletion phase: Scan did not complete successfully.")
+        elif graphql_had_errors:
+            logger.warning("Skipping deletion phase: GraphQL errors occurred during scan.")
         else:
-            logger.warning(f"Skipping deletion phase: Too few records found ({len(seen_ids)}). Possible API issue.")
+            logger.warning(
+                f"Skipping deletion phase: Too few records found ({len(seen_ids)} < {min_seen_required}). "
+                "Possible API issue."
+            )
         
     logger.info("Sync complete.")
-    logger.info(f"Summary: New: {stats['new']}, Updated: {stats['updated']}, Restored: {stats['restored']}, Deleted: {stats['deleted']}, Address Refreshed: {stats['address_refreshed']}, Unchanged: {stats['unchanged']}")
+    logger.info(
+        "Summary: New: %s, Updated: %s, Restored: %s, Deleted: %s, "
+        "Address Refreshed: %s, Missing Location: %s, Unchanged: %s",
+        stats["new"],
+        stats["updated"],
+        stats["restored"],
+        stats["deleted"],
+        stats["address_refreshed"],
+        stats["missing_location"],
+        stats["unchanged"]
+    )
+
+    summary_payload = {
+        "new": stats["new"],
+        "updated": stats["updated"],
+        "restored": stats["restored"],
+        "deleted": stats["deleted"],
+        "address_refreshed": stats["address_refreshed"],
+        "missing_location": stats["missing_location"],
+        "unchanged": stats["unchanged"],
+        "pages": page_index,
+        "seen_ids": len(seen_ids),
+        "active_existing": active_existing,
+        "min_seen_required": min_seen_required,
+        "graphql_error_count": graphql_error_count,
+        "completed_successfully": completed_successfully,
+        "graphql_had_errors": graphql_had_errors,
+        "timestamp_utc": datetime.utcnow().isoformat()
+    }
+
+    if SUMMARY_PATH:
+        try:
+            with open(SUMMARY_PATH, "w", encoding="utf-8") as f:
+                json.dump(summary_payload, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to write summary file: {e}")
+
+    github_summary = os.getenv("GITHUB_STEP_SUMMARY")
+    if github_summary:
+        try:
+            with open(github_summary, "a", encoding="utf-8") as f:
+                f.write("## Shelter Sync Summary\n\n")
+                for key, value in summary_payload.items():
+                    f.write(f"- **{key}**: {value}\n")
+        except Exception as e:
+            logger.warning(f"Failed to write GitHub summary: {e}")
 
 def upsert_to_supabase(batch: List[Dict]):
     if not batch: return
