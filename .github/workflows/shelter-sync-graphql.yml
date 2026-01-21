@@ -10,7 +10,7 @@ jobs:
   shelter-sync:
     name: Full Shelter Sync (GraphQL)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     concurrency:
       group: shelter-sync
       cancel-in-progress: true

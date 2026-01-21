@@ -20,7 +20,7 @@ import random
 import json
 import requests
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Set, Optional
 from dotenv import load_dotenv
 
@@ -55,6 +55,7 @@ GRAPHQL_RETRY_BASE_SLEEP = int(os.getenv("GRAPHQL_RETRY_BASE_SLEEP", "5")) # Bas
 SAFE_THRESHOLD = int(os.getenv("SAFE_THRESHOLD", "500"))
 MIN_DELETE_COVERAGE = float(os.getenv("MIN_DELETE_COVERAGE", "0.8"))
 SUMMARY_PATH = os.getenv("SUMMARY_PATH")
+LOG_PAGE_INTERVAL = int(os.getenv("LOG_PAGE_INTERVAL", "10"))
 
 # Logging setup
 logging.basicConfig(
@@ -275,6 +276,34 @@ def sync():
     insert_queue_partial = []
     
     session = requests.Session()
+
+    def write_summary(payload: Dict[str, Any]):
+        if not SUMMARY_PATH:
+            return
+        try:
+            with open(SUMMARY_PATH, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to write summary file: {e}")
+
+    summary_payload = {
+        "new": stats["new"],
+        "updated": stats["updated"],
+        "restored": stats["restored"],
+        "deleted": stats["deleted"],
+        "address_refreshed": stats["address_refreshed"],
+        "missing_location": stats["missing_location"],
+        "unchanged": stats["unchanged"],
+        "pages": page_index,
+        "seen_ids": len(seen_ids),
+        "active_existing": 0,
+        "min_seen_required": 0,
+        "graphql_error_count": graphql_error_count,
+        "completed_successfully": completed_successfully,
+        "graphql_had_errors": graphql_had_errors,
+        "timestamp_utc": datetime.utcnow().isoformat()
+    }
+    write_summary(summary_payload)
     
     def post_graphql_with_retry(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         for attempt in range(1, MAX_GRAPHQL_RETRIES + 1):
@@ -332,22 +361,25 @@ def sync():
             page_info = data_block.get('pageInfo', {})
             
             page_index += 1
-            logger.info(
-                "GraphQL page %s: nodes=%s, seen=%s, cursor=%s",
-                page_index,
-                len(nodes),
-                len(seen_ids),
-                after
-            )
+            if page_index % LOG_PAGE_INTERVAL == 0 or page_index == 1:
+                logger.info(
+                    "GraphQL progress: page=%s, nodes=%s, seen=%s",
+                    page_index,
+                    len(nodes),
+                    len(seen_ids)
+                )
 
             for node in nodes:
                 # FILTER: Only valid capacity
                 cap_val = node.get('byg069Sikringsrumpladser')
-                if not cap_val or int(cap_val) <= 0:
+                try:
+                    capacity = int(cap_val)
+                except (TypeError, ValueError):
+                    continue
+                if capacity <= 0:
                     continue
 
                 bygning_id = node['id_lokalId']
-                capacity = int(cap_val)
                 seen_ids.add(bygning_id)
                 
                 curr = existing_state.get(bygning_id)
@@ -361,7 +393,7 @@ def sync():
                     action = f"new (Cap: {capacity})"
                     stats["new"] += 1
                     needs_address = True
-                    logger.info(f"  [NEW] {bygning_id} (Cap: {capacity})")
+                    # Per-record logs are intentionally suppressed to keep output concise.
                 
                 else:
                     # EXISTING RECORD
@@ -372,12 +404,12 @@ def sync():
                         stats["restored"] += 1
                         record_update = {"deleted": None}
                         needs_address = True # Fetch address to ensure restored record is complete
-                        logger.info(f"  [RESTORED] {bygning_id}")
+                        # Per-record logs are intentionally suppressed to keep output concise.
                     
                     elif curr['capacity'] != capacity:
                         action = f"updated: Cap {curr['capacity']} -> {capacity}"
                         stats["updated"] += 1
-                        logger.info(f"  [UPDATED] {bygning_id}: Cap {curr['capacity']} -> {capacity}")
+                        # Per-record logs are intentionally suppressed to keep output concise.
                     
                     elif should_refresh_address(curr.get('last_checked')) or has_missing_location:
                         reason = "missing_loc" if has_missing_location else "stale"
@@ -397,19 +429,21 @@ def sync():
                     time.sleep(DAR_SLEEP_TIME) # Polite throttling
                     if addr_data.get("location") is None:
                         stats["missing_location"] += 1
-                    
+
+                    address_fields = {}
+                    for key in ("address", "postnummer", "vejnavn", "husnummer", "location"):
+                        if key in addr_data and addr_data.get(key) is not None:
+                            address_fields[key] = addr_data.get(key)
+
                     record_update.update({
                         "bygning_id": bygning_id,
                         "shelter_capacity": capacity,
                         "anvendelse": node.get('byg021BygningensAnvendelse'),
                         "kommunekode": node.get('kommunekode'),
-                        "address": addr_data.get("address"),
-                        "postnummer": addr_data.get("postnummer"),
-                        "vejnavn": addr_data.get("vejnavn"),
-                        "husnummer": addr_data.get("husnummer"),
-                        "location": addr_data.get("location"),
                         "last_checked": datetime.utcnow().isoformat()
                     })
+                    if address_fields:
+                        record_update.update(address_fields)
                     insert_queue_full.append(record_update)
                 else:
                     # Minimal update
@@ -435,12 +469,29 @@ def sync():
             # SAVE PROGRESS
             save_cursor(after)
 
-            logger.info(
-                "Page complete %s: has_next=%s, next_cursor=%s",
-                page_index,
-                has_next,
-                after
-            )
+            if page_index % LOG_PAGE_INTERVAL == 0 or not has_next:
+                logger.info(
+                    "Page complete %s: has_next=%s",
+                    page_index,
+                    has_next
+                )
+
+            summary_payload.update({
+                "new": stats["new"],
+                "updated": stats["updated"],
+                "restored": stats["restored"],
+                "deleted": stats["deleted"],
+                "address_refreshed": stats["address_refreshed"],
+                "missing_location": stats["missing_location"],
+                "unchanged": stats["unchanged"],
+                "pages": page_index,
+                "seen_ids": len(seen_ids),
+                "graphql_error_count": graphql_error_count,
+                "completed_successfully": completed_successfully,
+                "graphql_had_errors": graphql_had_errors,
+                "timestamp_utc": datetime.utcnow().isoformat()
+            })
+            write_summary(summary_payload)
             
             if not has_next:
                 completed_successfully = True
@@ -504,7 +555,7 @@ def sync():
         stats["unchanged"]
     )
 
-    summary_payload = {
+    summary_payload.update({
         "new": stats["new"],
         "updated": stats["updated"],
         "restored": stats["restored"],
@@ -520,14 +571,8 @@ def sync():
         "completed_successfully": completed_successfully,
         "graphql_had_errors": graphql_had_errors,
         "timestamp_utc": datetime.utcnow().isoformat()
-    }
-
-    if SUMMARY_PATH:
-        try:
-            with open(SUMMARY_PATH, "w", encoding="utf-8") as f:
-                json.dump(summary_payload, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to write summary file: {e}")
+    })
+    write_summary(summary_payload)
 
     github_summary = os.getenv("GITHUB_STEP_SUMMARY")
     if github_summary:
@@ -542,33 +587,19 @@ def sync():
 def upsert_to_supabase(batch: List[Dict]):
     if not batch: return
 
-    # Normalize batch: Ensure all items have the same keys
-    normalized_batch = []
+    cleaned_batch = []
     action_map = {} # Map ID to action for logging
 
     for item in batch:
         new_item = item.copy()
-        
-        # Extract and remove internal metadata
         if "_action" in new_item:
             action_map[new_item['bygning_id']] = new_item.pop("_action")
-            
-        normalized_batch.append(new_item)
-
-    # Re-scan keys after removing _action
-    all_keys = set().union(*(d.keys() for d in normalized_batch))
-    
-    final_batch = []
-    for item in normalized_batch:
-        for key in all_keys:
-            if key not in item:
-                item[key] = None
-        final_batch.append(item)
+        cleaned_batch.append(new_item)
 
     url = f"{SUPABASE_URL}/rest/v1/sheltersv2?on_conflict=bygning_id"
     try:
         # Explicitly specify the conflict column for upsert
-        r = requests.post(url, headers=HEADERS_SUPABASE, json=final_batch, timeout=30)
+        r = requests.post(url, headers=HEADERS_SUPABASE, json=cleaned_batch, timeout=30)
         r.raise_for_status()
         
         if len(batch) == 1:
