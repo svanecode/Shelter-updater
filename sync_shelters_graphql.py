@@ -45,7 +45,7 @@ def validate_env():
 BBR_GRAPHQL_URL = "https://graphql.datafordeler.dk/BBR/v1"
 
 # Tuning parameters
-BATCH_SIZE = 1 # Update immediately (no bulk)
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "200")) # Supabase upsert batch size
 DAR_SLEEP_TIME = float(os.getenv("DAR_SLEEP_TIME", "0.1")) # Throttle DAR requests
 GRAPHQL_PAGE_SLEEP = float(os.getenv("GRAPHQL_PAGE_SLEEP", "0.2")) # Throttle GraphQL pages
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "500")) # GraphQL objects per page
@@ -87,7 +87,11 @@ def fetch_existing_state() -> Dict[str, Dict[str, Any]]:
     while True:
         headers = {"Range": f"{offset}-{offset + limit - 1}"}
         # Select location to check if we need to backfill coordinates
-        url = f"{SUPABASE_URL}/rest/v1/sheltersv2?select=id,bygning_id,shelter_capacity,deleted,last_checked,location&order=id.asc"
+        url = (
+            f"{SUPABASE_URL}/rest/v1/sheltersv2?"
+            "select=id,bygning_id,shelter_capacity,deleted,last_checked,last_address_checked,"
+            "location,anvendelse,kommunekode&order=id.asc"
+        )
         data = None
         for attempt in range(1, 4):
             try:
@@ -112,7 +116,10 @@ def fetch_existing_state() -> Dict[str, Dict[str, Any]]:
                     'capacity': item.get('shelter_capacity'),
                     'deleted': item.get('deleted') is not None,
                     'last_checked': item.get('last_checked'),
-                    'location': item.get('location')
+                    'last_address_checked': item.get('last_address_checked'),
+                    'location': item.get('location'),
+                    'anvendelse': item.get('anvendelse'),
+                    'kommunekode': item.get('kommunekode')
                 }
 
         if len(data) < limit:
@@ -177,18 +184,23 @@ def fetch_address_data(husnummer_id: str) -> Dict[str, Any]:
         logger.warning(f"Failed to fetch address data for {husnummer_id}: {e}")
         return {}
 
-def should_refresh_address(last_checked_str: Optional[str]) -> bool:
+def should_refresh_address(
+    last_address_checked_str: Optional[str],
+    last_checked_str: Optional[str]
+) -> bool:
     """Returns True if the record hasn't been updated/checked in a long time."""
-    if not last_checked_str: return True
+    ts_str = last_address_checked_str or last_checked_str
+    if not ts_str:
+        return True
     try:
         # Robust parsing: Take first 19 chars (YYYY-MM-DDTHH:MM:SS) ignoring fractional/TZ
         # This avoids python version differences with isoformat
-        clean_ts = last_checked_str[:19]
+        clean_ts = ts_str[:19]
         last_checked = datetime.fromisoformat(clean_ts)
         days_diff = (datetime.utcnow() - last_checked).days
         return days_diff > ADDRESS_REFRESH_DAYS
     except ValueError as e:
-        logger.warning(f"Date parse error for {last_checked_str}: {e} -> Forcing refresh.")
+        logger.warning(f"Date parse error for {ts_str}: {e} -> Forcing refresh.")
         return True
 
 def save_cursor(cursor: Optional[str]):
@@ -227,6 +239,7 @@ def sync():
     existing_state = fetch_existing_state()
     
     seen_ids = set()
+    unchanged_ids = []
     stats = {
         "new": 0,
         "updated": 0,
@@ -238,6 +251,7 @@ def sync():
     }
     
     # Time variable for GraphQL (Datafordeler expects strict ISO8601)
+    run_ts = datetime.utcnow().isoformat()
     now_ts = datetime.utcnow().isoformat(timespec='seconds') + "Z"
     
     query = """
@@ -380,6 +394,8 @@ def sync():
                     continue
 
                 bygning_id = node['id_lokalId']
+                incoming_anvendelse = node.get('byg021BygningensAnvendelse')
+                incoming_kommunekode = node.get('kommunekode')
                 seen_ids.add(bygning_id)
                 
                 curr = existing_state.get(bygning_id)
@@ -406,19 +422,33 @@ def sync():
                         needs_address = True # Fetch address to ensure restored record is complete
                         # Per-record logs are intentionally suppressed to keep output concise.
                     
-                    elif curr['capacity'] != capacity:
-                        action = f"updated: Cap {curr['capacity']} -> {capacity}"
+                    elif (
+                        curr.get('capacity') != capacity
+                        or curr.get('anvendelse') != incoming_anvendelse
+                        or curr.get('kommunekode') != incoming_kommunekode
+                    ):
+                        action = (
+                            "updated (capacity/anvendelse/kommunekode changed)"
+                        )
                         stats["updated"] += 1
                         # Per-record logs are intentionally suppressed to keep output concise.
                     
-                    elif should_refresh_address(curr.get('last_checked')) or has_missing_location:
+                    elif (
+                        should_refresh_address(
+                            curr.get('last_address_checked'),
+                            curr.get('last_checked')
+                        )
+                        or has_missing_location
+                    ):
                         reason = "missing_loc" if has_missing_location else "stale"
-                        action = f"refresh_addr ({reason}, last: {curr.get('last_checked')})"
+                        last_addr = curr.get('last_address_checked') or curr.get('last_checked')
+                        action = f"refresh_addr ({reason}, last: {last_addr})"
                         stats["address_refreshed"] += 1
                         needs_address = True
                     
                     else:
                         stats["unchanged"] += 1
+                        unchanged_ids.append(bygning_id)
                         continue # Skip upsert if absolutely nothing changed
 
                 # Prepare the record
@@ -438,9 +468,11 @@ def sync():
                     record_update.update({
                         "bygning_id": bygning_id,
                         "shelter_capacity": capacity,
-                        "anvendelse": node.get('byg021BygningensAnvendelse'),
-                        "kommunekode": node.get('kommunekode'),
-                        "last_checked": datetime.utcnow().isoformat()
+                        "anvendelse": incoming_anvendelse,
+                        "kommunekode": incoming_kommunekode,
+                        "last_checked": run_ts,
+                        "last_seen_at": run_ts,
+                        "last_address_checked": run_ts
                     })
                     if address_fields:
                         record_update.update(address_fields)
@@ -450,7 +482,10 @@ def sync():
                     record_update.update({
                         "bygning_id": bygning_id,
                         "shelter_capacity": capacity,
-                        "last_checked": datetime.utcnow().isoformat()
+                        "anvendelse": incoming_anvendelse,
+                        "kommunekode": incoming_kommunekode,
+                        "last_checked": run_ts,
+                        "last_seen_at": run_ts
                     })
                     insert_queue_partial.append(record_update)
                 
@@ -512,6 +547,9 @@ def sync():
         upsert_to_supabase(insert_queue_full)
     if insert_queue_partial:
         upsert_to_supabase(insert_queue_partial)
+
+    if completed_successfully and not graphql_had_errors:
+        touch_last_seen(unchanged_ids, run_ts)
         
     # --- DELETION PHASE ---
     # Only proceed if we scanned a significant number of records to avoid wiping DB on API failure
@@ -643,6 +681,28 @@ def upsert_to_supabase(batch: List[Dict]):
                     if hasattr(r_single, 'text'):
                         logger.error(f"  Original Error: {r_single.text}")
         # If batch fails, we could try one by one, but for now just log it.
+
+def touch_last_seen(bygning_ids: List[str], run_ts: str):
+    if not bygning_ids:
+        return
+    chunk_size = 100
+    url = f"{SUPABASE_URL}/rest/v1/sheltersv2"
+    for i in range(0, len(bygning_ids), chunk_size):
+        chunk = bygning_ids[i:i + chunk_size]
+        params = {
+            "bygning_id": "in.(" + ",".join([f"\"{bid}\"" for bid in chunk]) + ")"
+        }
+        try:
+            r = requests.patch(
+                url,
+                headers=HEADERS_SUPABASE,
+                params=params,
+                json={"last_seen_at": run_ts},
+                timeout=30
+            )
+            r.raise_for_status()
+        except Exception as e:
+            logger.error(f"Failed to update last_seen_at for chunk: {e}")
 
 def soft_delete_in_supabase(ids: List[str]):
     chunk_size = 100

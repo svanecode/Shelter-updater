@@ -47,6 +47,7 @@ Optional tuning variables:
 ```env
 ADDRESS_REFRESH_DAYS=90
 PAGE_SIZE=500
+BATCH_SIZE=200
 GRAPHQL_PAGE_SLEEP=0.2
 DAR_SLEEP_TIME=0.1
 MAX_GRAPHQL_RETRIES=8
@@ -76,6 +77,7 @@ MIN_DELETE_COVERAGE=0.8
     *   **New ID:** Fetch Address -> Insert.
     *   **Capacity Change:** Update Capacity -> Update.
     *   **Stale Address (>90 days):** Re-fetch Address -> Update.
+    *   **Seen in BBR:** Updates `last_seen_at` even if unchanged.
     *   **Deleted Flagged:** If found again -> Restore (Un-delete).
     *   **Missing from BBR:** If an ID in DB is not found in BBR -> Soft Delete (set `deleted` timestamp).
 

@@ -32,6 +32,7 @@ Fill in the following variables:
 Optional tuning variables:
 *   `ADDRESS_REFRESH_DAYS`: Days before refreshing address data (default 90).
 *   `PAGE_SIZE`: GraphQL page size (default 500).
+*   `BATCH_SIZE`: Supabase upsert batch size (default 200).
 *   `GRAPHQL_PAGE_SLEEP`: Delay between pages in seconds (default 0.2).
 *   `DAR_SLEEP_TIME`: Delay between address lookups in seconds (default 0.1).
 *   `MAX_GRAPHQL_RETRIES`: Retries per GraphQL page (default 8).

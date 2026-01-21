@@ -21,8 +21,14 @@ create table if not exists public.sheltersv2 (
     
     -- System Metadata
     last_checked timestamp with time zone,
+    last_seen_at timestamp with time zone, -- Last time record was seen in BBR
+    last_address_checked timestamp with time zone, -- Last time address was refreshed from DAR
     deleted timestamp with time zone -- If set, the shelter is considered "soft deleted"
 );
+
+-- Ensure new metadata columns exist for existing deployments
+alter table public.sheltersv2 add column if not exists last_seen_at timestamp with time zone;
+alter table public.sheltersv2 add column if not exists last_address_checked timestamp with time zone;
 
 -- 2. Create indexes for performance
 create index if not exists idx_sheltersv2_bygning_id on public.sheltersv2 (bygning_id);
